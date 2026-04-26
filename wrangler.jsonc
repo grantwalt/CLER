@@ -1,0 +1,23 @@
+{
+  "name": "clerkai-medical-worker",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "workers_dev": true,
+  "kv_namespaces": [
+    {
+      "binding": "CASES_KV",
+      "id": "cdea5b79bd5d40f68392b9218db77e17",
+      "preview_id": "d7b30fbdfe2448abacf03ebf9cce596a"
+    },
+    {
+      "binding": "SCORES_KV",
+      "id": "5ed0a83b8e1a40f2bacb7f299c3490fa",
+      "preview_id": "c966d0cad4244cd3a67cf884eb25f456"
+    },
+    {
+      "binding": "KNOWLEDGE_KV",
+      "id": "b6e4812e8f2d4cbb91b451d069cc595d",
+      "preview_id": "11a415945a124edcae207b7ef296382b"
+    }
+  ]
+}
