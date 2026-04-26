@@ -39,7 +39,8 @@
  *   KNOWLEDGE_KV   — medical knowledge bank (pearls, clusters, etc.)
  *
  * Environment variables:
- *   ADMIN_SECRET   — Bearer token for admin endpoints
+ *   ADMIN_SECRET       — Bearer token for admin endpoints
+ *   ANTHROPIC_API_KEY  — API key for /ai and /ai-feedback proxy endpoints
  */
 
 // ─── CORS HEADERS ──────────────────────────────────────────────
@@ -68,6 +69,8 @@ export default {
       if (url.pathname === '/health')                           return handleHealth(env);
       if (url.pathname === '/cases'           && method === 'GET')  return handleCases(url, env);
       if (url.pathname === '/chat'            && method === 'POST') return handleChat(request, env);
+      if (url.pathname === '/ai'              && method === 'POST') return handleAI(request, env);
+      if (url.pathname === '/ai-feedback'     && method === 'POST') return handleAIFeedback(request, env);
       if (url.pathname === '/scores'          && method === 'POST') return handleScore(request, env);
       if (url.pathname === '/leaderboard'     && method === 'GET')  return handleLeaderboard(url, env);
       if (url.pathname === '/admin/ingest'    && method === 'POST') return handleIngest(request, env);
@@ -544,6 +547,22 @@ async function handleHealth(env) {
 //  CASES — GET /cases?discipline=peds|med|surg|og
 // ══════════════════════════════════════════════════════════════
 
+/**
+ * serialiseCases(cases)
+ * Converts RegExp trapAction patterns to { pattern, flags } strings
+ * so they survive JSON serialisation and can be reconstructed client-side.
+ */
+function serialiseCases(cases) {
+  return cases.map(c => ({
+    ...c,
+    trapActions: (c.trapActions || []).map(t => ({
+      ...t,
+      pattern: t.pattern instanceof RegExp ? t.pattern.source : (t.pattern || ''),
+      flags:   t.pattern instanceof RegExp ? t.pattern.flags  : (t.flags || 'i'),
+    })),
+  }));
+}
+
 async function handleCases(url, env) {
   const discipline = url.searchParams.get('discipline');
   if (!discipline) return err('discipline param required');
@@ -551,11 +570,11 @@ async function handleCases(url, env) {
     const raw = await env.CASES_KV.get(`cases:${discipline}`);
     if (raw) {
       const cases = JSON.parse(raw);
-      return json({ cases, source: 'kv', count: cases.length });
+      return json({ cases: serialiseCases(cases), source: 'kv', count: cases.length });
     }
   }
   const cases = BUILTIN_CASES.filter(c => c.discipline === discipline);
-  return json({ cases, source: 'builtin', count: cases.length });
+  return json({ cases: serialiseCases(cases), source: 'builtin', count: cases.length });
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -688,6 +707,125 @@ async function handleChat(request, env) {
     normalisedText: normText,
     temperamentApplied: temperament,
   });
+}
+
+// ══════════════════════════════════════════════════════════════
+//  AI — POST /ai
+//  Proxies an AI patient simulation to Anthropic.
+//  Body: { caseId, conversationHistory, askedIntents }
+//  Requires env.ANTHROPIC_API_KEY
+// ══════════════════════════════════════════════════════════════
+
+async function handleAI(request, env) {
+  if (!env.ANTHROPIC_API_KEY) {
+    return err('ANTHROPIC_API_KEY not configured on worker', 503);
+  }
+  const body = await request.json();
+  const { caseId, conversationHistory = [], askedIntents = [] } = body;
+  if (!caseId) return err('caseId required');
+
+  const caseData = await resolveCase(caseId, env);
+  if (!caseData) return err(`Case ${caseId} not found`, 404);
+
+  const p = caseData.patient;
+  const systemPrompt =
+    `You are ${p.name}, a ${p.age}-year-old ${p.sex.toLowerCase()} patient at ${caseData.hospital || 'a Nigerian teaching hospital'}. ` +
+    `Presenting complaint: ${caseData.presentingComplaint}. ` +
+    `You have ${caseData.diagnosis.primary} but you do NOT know your diagnosis. ` +
+    `Answer the doctor's questions naturally, as a real patient would. Keep responses to 1–4 sentences. ` +
+    `If asked about something not relevant to your case, say you don't know or it's not relevant. ` +
+    `Be authentic — use natural speech patterns appropriate for a Nigerian patient.`;
+
+  const anthropicResp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 200,
+      system: systemPrompt,
+      messages: conversationHistory,
+    }),
+  });
+
+  if (!anthropicResp.ok) {
+    const errBody = await anthropicResp.text().catch(() => '');
+    console.error('Anthropic /ai error:', anthropicResp.status, errBody);
+    return err('Upstream AI error', 502);
+  }
+
+  const data = await anthropicResp.json();
+  const reply = data.content?.[0]?.text || "I'm not sure how to answer that.";
+
+  // Also classify intent for scoring hints (non-authoritative — client scores too)
+  const normText = normaliseText(conversationHistory.at(-1)?.content || '');
+  const intent = classifyIntent(normText, INTENT_PATTERNS);
+  let intentId = null, score = 0;
+  if (intent && !askedIntents.includes(intent.id) && caseData.intentMap[intent.id]) {
+    intentId = intent.id;
+    const isMust = caseData.scoringMap.mustAsk.includes(intent.id);
+    const isShould = caseData.scoringMap.shouldAsk.includes(intent.id);
+    score = isMust ? (caseData.scoringMap.pointsMust || 15)
+          : isShould ? (caseData.scoringMap.pointsBase || 10)
+          : 5;
+  }
+
+  return json({ reply, intentId, score });
+}
+
+// ══════════════════════════════════════════════════════════════
+//  AI FEEDBACK — POST /ai-feedback
+//  Generates personalised end-of-case clinical feedback.
+//  Body: { caseId, diagnosis, attempt, correct, askedIntents,
+//          missedMust, netScore, grossScore, penalties, penaltyCount }
+//  Requires env.ANTHROPIC_API_KEY
+// ══════════════════════════════════════════════════════════════
+
+async function handleAIFeedback(request, env) {
+  if (!env.ANTHROPIC_API_KEY) {
+    return err('ANTHROPIC_API_KEY not configured on worker', 503);
+  }
+  const body = await request.json();
+  const {
+    diagnosis, attempt, correct,
+    askedIntents = [], missedMust = [],
+    netScore, grossScore, penalties, penaltyCount,
+  } = body;
+
+  const prompt =
+    `You are a clinical tutor at a Nigerian teaching hospital. ` +
+    `Case diagnosis: ${diagnosis}. ` +
+    `Student asked ${askedIntents.length} questions and ` +
+    `${correct ? 'correctly' : 'incorrectly'} diagnosed (attempt: "${attempt}"). ` +
+    `Net score: ${netScore} (gross ${grossScore}, penalties −${penalties}). ` +
+    `Penalty actions: ${penaltyCount}. ` +
+    `Topics covered: ${askedIntents.slice(0, 8).join(', ') || 'none'}. ` +
+    `Missed key questions: ${missedMust.join(', ') || 'none'}. ` +
+    `Give exactly 3 focused sentences of clinical feedback. ` +
+    `Mention negative marking if penalties > 0. Be specific, warm, and educational. No bullet points.`;
+
+  const anthropicResp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 250,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+
+  if (!anthropicResp.ok) {
+    return err('Upstream AI error', 502);
+  }
+  const data = await anthropicResp.json();
+  return json({ feedback: data.content?.[0]?.text || '' });
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1072,7 +1210,8 @@ const INTENT_PATTERNS = [
 const BUILTIN_CASES = [
   {
     caseId: 'case_surg_appendicitis_001',
-    discipline: 'surg', difficulty: 'intermediate', timeLimit: 600,
+    discipline: 'surg', specialty: 'surgery', difficulty: 'intermediate',
+    timeLimit: 600, estimatedMinutes: 10,
     hospital: 'LUTH Lagos',
     patient: { name: 'Chidi Nwosu', age: 19, sex: 'Male', occupation: 'University Student', avatar: '🧑' },
     presentingComplaint: 'Severe right-sided abdominal pain for 18 hours',
@@ -1111,7 +1250,8 @@ const BUILTIN_CASES = [
   },
   {
     caseId: 'case_peds_malaria_001',
-    discipline: 'peds', difficulty: 'beginner', timeLimit: 480,
+    discipline: 'peds', specialty: 'paediatrics', difficulty: 'beginner',
+    timeLimit: 480, estimatedMinutes: 8,
     hospital: 'UCH Ibadan',
     patient: { name: 'Emeka Adeyemi', age: 4, sex: 'Male', occupation: 'Pre-school', avatar: '👦' },
     presentingComplaint: 'High fever, vomiting and drowsiness for 2 days',
@@ -1152,7 +1292,8 @@ const BUILTIN_CASES = [
   },
   {
     caseId: 'case_peds_asthma_001',
-    discipline: 'peds', difficulty: 'beginner', timeLimit: 480,
+    discipline: 'peds', specialty: 'paediatrics', difficulty: 'beginner',
+    timeLimit: 480, estimatedMinutes: 8,
     hospital: 'LUTH Lagos',
     patient: { name: 'Adaeze Obi', age: 8, sex: 'Female', occupation: 'Primary school', avatar: '👧' },
     presentingComplaint: 'Wheezing and difficulty breathing for 4 hours',
@@ -1186,7 +1327,8 @@ const BUILTIN_CASES = [
   },
   {
     caseId: 'case_og_preeclampsia_001',
-    discipline: 'og', difficulty: 'hard', timeLimit: 720,
+    discipline: 'og', specialty: 'obstetrics', difficulty: 'hard',
+    timeLimit: 720, estimatedMinutes: 12,
     hospital: 'LASUTH Ikeja',
     patient: { name: 'Fatima Bello', age: 26, sex: 'Female', occupation: 'Trader', avatar: '🤰' },
     presentingComplaint: 'Headache and swollen legs at 34 weeks gestation',
@@ -1225,7 +1367,8 @@ const BUILTIN_CASES = [
   },
   {
     caseId: 'case_med_hf_001',
-    discipline: 'med', difficulty: 'hard', timeLimit: 720,
+    discipline: 'med', specialty: 'cardiology', difficulty: 'hard',
+    timeLimit: 720, estimatedMinutes: 12,
     hospital: 'UCH Ibadan',
     patient: { name: 'Emmanuel Okafor', age: 58, sex: 'Male', occupation: 'Retired Civil Servant', avatar: '👴' },
     presentingComplaint: 'Worsening breathlessness and ankle swelling for 3 weeks',
