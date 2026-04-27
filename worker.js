@@ -1,5 +1,5 @@
 /**
- * ClerkAI — Cloudflare Worker Suite  v2.0
+ * ClerkAI — Cloudflare Worker Suite  v5.0
  * ══════════════════════════════════════════════════════════════
  * Offline Clinical Reasoning Simulator
  * Zero-LLM, fully rule-based medical intelligence engine.
@@ -23,9 +23,54 @@
  *     from KV (or a rich built-in bank), feeding the student a
  *     clinical nugget after the patient's answer.
  *
+ * ✦ UPGRADE 5 — Dynamic Differential Tracker
+ *     Differential probabilities update in real-time as the
+ *     student gathers history, exam and investigation data.
+ *     Uses per-case intentWeights or a built-in default map.
+ *     Every /chat response now includes a ranked `differentials`
+ *     array with live probability percentages.
+ *
+ * ✦ UPGRADE 6 — Phase Tracking & Progressive Scoring
+ *     Enforces HISTORY → EXAM → INVESTIGATION clinical workflow.
+ *     Detects phase regression (e.g. jumping to investigations
+ *     before taking history) and applies a −2 pt tutor warning.
+ *     Every /chat response includes `currentPhase` and
+ *     `intentPhase` so the UI can render a progress indicator.
+ *
+ * ✦ UPGRADE 7 — Static Paediatrics Knowledge Bank
+ *     peds_knowledge_bank.json (53 topics, 80 entries) is
+ *     bundled at deploy time via ES module import — zero KV
+ *     reads, zero cold-start cost. Lookup priority:
+ *       KV (dynamic) → Static bank → BUILTIN_PEARLS
+ *     resolveCase() auto-enriches every case with differentials,
+ *     management pearls, and clinical features from the bank.
+ *     /admin/knowledge now supports: topic=, drug=, guideline=,
+ *     search=, and list=1 queries across the static bank.
+ *
+ * ✦ UPGRADE 8 — Dynamic Nigerian Patient Engine
+ *     Layered over the personality system, this upgrade adds:
+ *       • Medical jargon detection — patient replies with
+ *         authentic confusion when student uses clinical terms
+ *         a layperson wouldn't understand.
+ *       • Progressive disclosure — repeated questions trigger
+ *         natural patient fatigue/mild frustration.
+ *       • Nigerian cultural context injection — probabilistic
+ *         openers, self-medication disclosures, and faith-coping
+ *         statements drawn from authentic Nigerian health-seeking
+ *         language pools (40%/30%/20% injection rates).
+ *       • Dynamic temperament drift — patient becomes more
+ *         guarded after unsafe clinical choices (penalties >10)
+ *         and anxious after phase-order violations.
+ *     POST /chat now accepts `penalties` (cumulative session
+ *     penalty total) for real-time temperament adjustment.
+ *
  * Routes:
  *   GET  /cases?discipline=            → Serve cases from KV (or built-in bank)
  *   POST /chat                         → Patient simulation (intent engine)
+ *                                         Body: { caseId, message, conversationHistory,
+ *                                                 askedIntents, penalties }
+ *                                         penalties = cumulative session penalty total
+ *                                         (used by Upgrade 8 temperament drift)
  *   POST /scores                       → Score persistence & leaderboard
  *   GET  /leaderboard?discipline=      → Top scores
  *   GET  /health                       → Backend health probe
@@ -39,9 +84,67 @@
  *   KNOWLEDGE_KV   — medical knowledge bank (pearls, clusters, etc.)
  *
  * Environment variables:
- *   ADMIN_SECRET       — Bearer token for admin endpoints
- *   ANTHROPIC_API_KEY  — API key for /ai and /ai-feedback proxy endpoints
+ *   ADMIN_SECRET   — Bearer token for admin endpoints
  */
+
+// ══════════════════════════════════════════════════════════════
+//  STATIC KNOWLEDGE BANK IMPORT
+//  peds_knowledge_bank.json is bundled at deploy time by Wrangler.
+//  Lookup order in getPearl(): KV → static bank → BUILTIN_PEARLS.
+//  To add more disciplines: import and merge below.
+// ══════════════════════════════════════════════════════════════
+import pedsBank from './knowledge/peds_knowledge_bank.json';
+
+/**
+ * STATIC_BANK
+ * Merged view of all imported discipline banks.
+ * Add future banks here: { ...pedsBank, ...surgBank, ...medBank }
+ */
+const STATIC_BANK = {
+  ...pedsBank,
+};
+
+/**
+ * bankLookupTopic(diagnosisPrimary)
+ * Returns the topic entry for a given diagnosis name from the static bank,
+ * matching flexibly (slug, partial name, or full name).
+ */
+function bankLookupTopic(diagnosisPrimary) {
+  if (!diagnosisPrimary) return null;
+  const slug = diagnosisPrimary.toLowerCase().replace(/[\s()'/]+/g, '_').replace(/_+/g, '_');
+
+  // Direct slug match
+  if (STATIC_BANK[`topic:${slug}`]) return STATIC_BANK[`topic:${slug}`];
+
+  // Fuzzy match: find any topic whose name contains the diagnosis string
+  const needle = diagnosisPrimary.toLowerCase();
+  for (const [key, val] of Object.entries(STATIC_BANK)) {
+    if (!key.startsWith('topic:')) continue;
+    if (val.name && val.name.toLowerCase().includes(needle)) return val;
+    if (key.includes(slug.slice(0, 12))) return val; // prefix match
+  }
+  return null;
+}
+
+/**
+ * bankLookupDrug(drugName)
+ * Returns drug info entry from static bank.
+ */
+function bankLookupDrug(drugName) {
+  if (!drugName) return null;
+  const slug = drugName.toLowerCase().replace(/\s+/g, '_');
+  return STATIC_BANK[`drug:${slug}`] || null;
+}
+
+/**
+ * bankLookupGuideline(topic)
+ * Returns guideline entry from static bank.
+ */
+function bankLookupGuideline(topic) {
+  if (!topic) return null;
+  const slug = topic.toLowerCase().replace(/\s+/g, '_');
+  return STATIC_BANK[`guideline:${slug}`] || null;
+}
 
 // ─── CORS HEADERS ──────────────────────────────────────────────
 const CORS = {
@@ -69,8 +172,6 @@ export default {
       if (url.pathname === '/health')                           return handleHealth(env);
       if (url.pathname === '/cases'           && method === 'GET')  return handleCases(url, env);
       if (url.pathname === '/chat'            && method === 'POST') return handleChat(request, env);
-      if (url.pathname === '/ai'              && method === 'POST') return handleAI(request, env);
-      if (url.pathname === '/ai-feedback'     && method === 'POST') return handleAIFeedback(request, env);
       if (url.pathname === '/scores'          && method === 'POST') return handleScore(request, env);
       if (url.pathname === '/leaderboard'     && method === 'GET')  return handleLeaderboard(url, env);
       if (url.pathname === '/admin/ingest'    && method === 'POST') return handleIngest(request, env);
@@ -336,7 +437,204 @@ const DISTRESS_INTENTS = new Set([
 ]);
 
 // ══════════════════════════════════════════════════════════════
-//  UPGRADE 4 — KNOWLEDGE EXPANSION (BUILT-IN PEARL BANK)
+//  UPGRADE 8 — DYNAMIC NIGERIAN PATIENT ENGINE
+//  Layered over Upgrade 3 (personality). Adds four subsystems:
+//
+//   1. Jargon detection   — patient replies with authentic
+//      confusion when the student uses medical terminology
+//      a Nigerian lay patient would not understand.
+//
+//   2. Progressive disclosure — repeated questions elicit
+//      natural patient fatigue and mild frustration.
+//
+//   3. Nigerian cultural context injection — probabilistic
+//      authentic openers, self-medication disclosures, and
+//      faith-coping statements (40%/30%/20% injection rates).
+//
+//   4. Dynamic temperament drift — patient becomes more
+//      guarded (reticent) after cumulative penalties >10,
+//      and anxious after any phase-order violation.
+//
+//  POST /chat must include `penalties` (cumulative session
+//  total) for temperament drift to activate.
+//  Zero breaking changes to existing Upgrades 1–7.
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * Regex of common medical jargon that a lay Nigerian patient
+ * would not understand. Checked against the *student's* input.
+ */
+const MEDICAL_JARGON = /\b(haemoglobin|neutrophilia|orthopnoea|hyperreflexia|papilloedema|auscultate|palpate|mcburney|rovsing|creatinine|splenomegaly|hepatomegaly|jugular\s*venous|sternal\s*angle|epigastric\s*tenderness|bradycardia|tachycardia|auscultation|percussion\s*note|dullness|crepitations|dyspnoea|paraesthesia|diaphoresis|diuresis|proteinuria|thrombocytopaenia|coagulopathy|hepatosplenomegaly|fundoscopy|clonus|hyperparasitaemia)\b/i;
+
+/**
+ * Culturally authentic Nigerian patient language pools.
+ * Used to inject realistic context into patient replies.
+ */
+const NIGERIAN_CONTEXT = {
+  openers: [
+    'Please doctor, ',
+    'To be honest with you, ',
+    'Actually, ',
+    'You see, ',
+    'I must tell you, ',
+    'Ehen, well — ',
+    'To cut the long story short, ',
+  ],
+  self_med: [
+    'Before coming here I bought paracetamol and amoxil from the chemist down the road.',
+    'I tried some agbo (herbal mixture) that my aunt prepared — it didn\'t help.',
+    'I got some malaria and typhoid combination drugs over the counter and started them.',
+    'I used hot water and local herbs first, but the symptoms kept getting worse.',
+    'My neighbour gave me some of her tablets — I don\'t know the name exactly.',
+  ],
+  faith_coping: [
+    'I\'ve been praying over it and believing God for healing.',
+    'My pastor laid hands on me last Sunday, but I\'m still not feeling right.',
+    'I believe God will see me through, but I need your help too, doctor.',
+    'My church members said it\'s spiritual — but it keeps getting worse so I came.',
+  ],
+};
+
+/**
+ * handleJargonResponse(studentText, builtReply)
+ * Intercepts the built reply and replaces it with a jargon-
+ * confusion response if the student's question contained
+ * medical terminology a lay patient would not understand.
+ * Returns the original reply untouched if no jargon found.
+ */
+function handleJargonResponse(studentText, builtReply) {
+  if (!MEDICAL_JARGON.test(studentText)) return builtReply;
+  const pool = [
+    "Sorry doctor, I don't understand that word. Can you ask me in simpler language?",
+    "I'm not a medical person, doctor. Please explain what you mean.",
+    "That sounds very complicated. Are you asking about my symptoms?",
+    "I just want to feel better — can you ask me in plain English please?",
+    "I don't know that term. What exactly are you asking?",
+  ];
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+/**
+ * applyProgressiveDisclosure(baseText, intentId, askedIntents)
+ * Adjusts the reply tone when the student asks about a topic
+ * they have already explored — simulating natural patient fatigue
+ * from answering the same question multiple times.
+ */
+function applyProgressiveDisclosure(baseText, intentId, askedIntents) {
+  if (!intentId) return baseText;
+  const askCount = askedIntents.filter(id => id === intentId).length;
+  if (askCount === 0) return baseText;
+  if (askCount === 1) {
+    return `${baseText} (I mentioned this before, but yes — I'll repeat it.)`;
+  }
+  // Two or more repeats → mild frustration
+  const firstSentence = baseText.split(/[.!?]/)[0] || baseText;
+  return `(Slightly impatient) I already told you that, doctor. ${firstSentence}.`;
+}
+
+/**
+ * injectNigerianContext(text, intentId, rng)
+ * Probabilistically layers authentic Nigerian health-seeking
+ * language into the patient reply:
+ *   • Cultural openers (40% of responses)
+ *   • Self-medication disclosures (30%, only on symptom intents)
+ *   • Faith-coping statements (20%, only on severe symptom intents)
+ *
+ * rng must be the same deterministic 0–1 value used elsewhere
+ * in this response cycle to keep behaviour reproducible.
+ */
+function injectNigerianContext(text, intentId, rng) {
+  let reply = text;
+  const id  = intentId || '';
+
+  // Cultural opener (40%)
+  if (rng < 0.40) {
+    const pool = NIGERIAN_CONTEXT.openers;
+    reply = pool[Math.floor(rng * pool.length)] + reply;
+  }
+
+  // Self-medication reference (30%, only for symptom/history intents)
+  const isSymptomIntent = id.startsWith('hpc') || id.startsWith('sr_')
+    || id === 'pmh_general' || id === 'meds_general';
+  if (isSymptomIntent && rng < 0.30) {
+    const pool = NIGERIAN_CONTEXT.self_med;
+    reply += ` ${pool[Math.floor(rng * pool.length)]}`;
+  }
+
+  // Faith coping (20%, only for severe/alarming symptom intents)
+  const isSevereIntent = id.includes('pain') || id.includes('fever')
+    || id.includes('consciousness') || id.includes('seizure')
+    || id.includes('fetal') || id.includes('chest');
+  if (isSevereIntent && rng < 0.20) {
+    const pool = NIGERIAN_CONTEXT.faith_coping;
+    reply += ` ${pool[Math.floor(rng * pool.length)]}`;
+  }
+
+  return reply;
+}
+
+/**
+ * shiftTemperament(baseTemperament, cumulativePenalties, phaseViolationOccurred)
+ * Applies dynamic emotional drift: the patient becomes more guarded
+ * when the student accumulates heavy penalties (unsafe practice)
+ * or immediately anxious when a phase-order violation occurs
+ * (suggesting an inexperienced or disorganised clinician).
+ * The shifted temperament overrides the static case assignment
+ * for the current reply only — the session base is unchanged.
+ */
+function shiftTemperament(baseTemperament, cumulativePenalties, phaseViolationOccurred) {
+  if (cumulativePenalties > 10) return 'reticent';   // Guarded after unsafe choices
+  if (phaseViolationOccurred)   return 'anxious';    // Worried by disorganised clerk
+  return baseTemperament;
+}
+
+/**
+ * generatePatientResponse(opts)
+ * Master orchestrator for Upgrade 8. Calls all four sub-systems
+ * in the correct pipeline order, then returns the finished reply.
+ *
+ * Pipeline:
+ *   1. Dynamic temperament drift  (shiftTemperament)
+ *   2. Personality wrapper        (applyPersonality — Upgrade 3)
+ *   3. Progressive disclosure     (applyProgressiveDisclosure)
+ *   4. Nigerian cultural context  (injectNigerianContext)
+ *   5. Jargon confusion guard     (handleJargonResponse) — runs last
+ *      so it can override the full pipeline output when triggered.
+ */
+function generatePatientResponse({
+  baseText,
+  intentId,
+  studentText,             // normalised student input — for jargon check
+  baseTemperament,
+  isDistressed,
+  askedIntents,
+  cumulativePenalties = 0,
+  phaseViolationOccurred = false,
+  rng,
+}) {
+  // 1. Drift temperament based on session performance
+  const dynamicTemperament = shiftTemperament(
+    baseTemperament,
+    cumulativePenalties,
+    phaseViolationOccurred,
+  );
+
+  // 2. Apply personality wrapper (Upgrade 3)
+  let reply = applyPersonality(baseText, dynamicTemperament, isDistressed, rng);
+
+  // 3. Progressive disclosure (fatigue on repeated intents)
+  reply = applyProgressiveDisclosure(reply, intentId, askedIntents);
+
+  // 4. Inject Nigerian cultural/linguistic context
+  reply = injectNigerianContext(reply, intentId, rng);
+
+  // 5. Jargon confusion guard — overrides everything if triggered
+  reply = handleJargonResponse(studentText, reply);
+
+  return reply;
+}
+
+
 //  Provides clinical teaching pearls for every intent. These
 //  fire when the intent is scored (mustAsk or shouldAsk).
 //  KV overrides the built-in bank if a match is found.
@@ -495,7 +793,7 @@ const BUILTIN_PEARLS = {
  * Priority: KV knowledge bank → built-in bank (diagnosis-specific → generic).
  */
 async function getPearl(intentId, diagnosisPrimary, env) {
-  // 1. Try KV first
+  // ── 1. KV knowledge bank (dynamic — ingested via /admin/ingest) ──
   if (env?.KNOWLEDGE_KV) {
     try {
       const diagKey = `topic:${(diagnosisPrimary || '').toLowerCase().replace(/\s+/g, '_')}`;
@@ -503,7 +801,7 @@ async function getPearl(intentId, diagnosisPrimary, env) {
       if (raw) {
         const data = JSON.parse(raw);
         const pearls = data.pearls || data.clinicalPearls;
-        if (pearls && pearls[intentId]) return `📚 *Clinical pearl:* ${pearls[intentId]}`;
+        if (pearls?.[intentId]) return `📚 *Clinical pearl:* ${pearls[intentId]}`;
       }
     } catch (_) {}
     try {
@@ -516,7 +814,28 @@ async function getPearl(intentId, diagnosisPrimary, env) {
     } catch (_) {}
   }
 
-  // 2. Fall back to built-in pearl bank
+  // ── 2. Static peds knowledge bank (bundled — zero KV reads) ──────
+  // 2a. Diagnosis-specific pearl from the topic entry
+  const topic = bankLookupTopic(diagnosisPrimary);
+  if (topic?.pearls?.[intentId]) {
+    return `📚 *Clinical pearl:* ${topic.pearls[intentId]}`;
+  }
+
+  // 2b. Generic intent pearl (pearl:hpc_onset, pearl:ix_fbc, etc.)
+  const genericPearl = STATIC_BANK[`pearl:${intentId}`];
+  if (genericPearl?.content) {
+    return `📚 *Teaching point:* ${genericPearl.content}`;
+  }
+
+  // 2c. Drug info pearl (if intentId looks like a drug question)
+  if (intentId.startsWith('meds_') || intentId.startsWith('drug_')) {
+    const drugEntry = STATIC_BANK[`drug:${intentId.replace(/^(meds_|drug_)/, '')}`];
+    if (drugEntry?.nigerian_pearl) {
+      return `📚 *Drug note:* ${drugEntry.nigerian_pearl}`;
+    }
+  }
+
+  // ── 3. BUILTIN_PEARLS (original hardcoded bank — lowest priority) ─
   const intentPearls = BUILTIN_PEARLS[intentId];
   if (!intentPearls) return null;
   const diagKey = (diagnosisPrimary || '').toLowerCase();
@@ -531,9 +850,16 @@ async function getPearl(intentId, diagnosisPrimary, env) {
 async function handleHealth(env) {
   return json({
     status: 'online',
-    engine: 'ClerkAI Medical Engine v2.0 — Offline Clinical Reasoning Simulator',
+    engine: 'ClerkAI Medical Engine v5.0 — Offline Clinical Reasoning Simulator',
     mode: 'rule-based',
-    upgrades: ['text-normalisation', 'intent-clustering', 'personality-system', 'knowledge-expansion'],
+    upgrades: ['text-normalisation', 'intent-clustering', 'personality-system', 'knowledge-expansion', 'differential-tracker', 'phase-tracking', 'static-peds-knowledge-bank', 'dynamic-nigerian-patient-engine'],
+    knowledgeBank: {
+      entries: Object.keys(STATIC_BANK).length,
+      topics:  Object.keys(STATIC_BANK).filter(k => k.startsWith('topic:')).length,
+      pearls:  Object.keys(STATIC_BANK).filter(k => k.startsWith('pearl:')).length,
+      drugs:   Object.keys(STATIC_BANK).filter(k => k.startsWith('drug:')).length,
+      guidelines: Object.keys(STATIC_BANK).filter(k => k.startsWith('guideline:')).length,
+    },
     timestamp: Date.now(),
     kvBindings: {
       cases: !!env.CASES_KV,
@@ -588,7 +914,7 @@ async function handleCases(url, env) {
 
 async function handleChat(request, env) {
   const body = await request.json();
-  const { caseId, message, conversationHistory = [], askedIntents = [] } = body;
+  const { caseId, message, conversationHistory = [], askedIntents = [], penalties: clientPenalties = 0 } = body;
   if (!caseId || !message) return err('caseId and message required');
 
   const caseData = await resolveCase(caseId, env);
@@ -634,6 +960,10 @@ async function handleChat(request, env) {
       ? await getPearl(primaryId, caseData.diagnosis?.primary, env)
       : null;
 
+    // ── UPGRADE 5: Compute updated differentials after cluster ──
+    const allAskedAfterCluster = [...askedIntents, ...scored.map(s => s.intentId)];
+    const updatedDifferentials = updateDifferentials(caseData, allAskedAfterCluster);
+
     return json({
       reply: replies.join('\n\n---\n\n'),
       intentId: primaryId || null,
@@ -643,6 +973,7 @@ async function handleChat(request, env) {
       clusterIntents: scored,
       pearl,
       normalisedText: normText,
+      differentials: updatedDifferentials,
     });
   }
 
@@ -653,51 +984,83 @@ async function handleChat(request, env) {
   const intent = classifyIntent(normText, INTENT_PATTERNS);
   if (!intent) {
     const fallback = generateFallback(normText, caseData, conversationHistory);
+    // Still return current differentials so the UI stays in sync
+    const currentDifferentials = updateDifferentials(caseData, askedIntents);
     return json({
       reply: fallback,
       intentId: null, type: 'fallback',
       isDangerous: false, score: 0,
       normalisedText: normText,
       temperamentApplied: temperament,
+      differentials: currentDifferentials,
     });
   }
 
   const responseData = caseData.intentMap[intent.id];
   if (!responseData) {
     const notApplicable = generateNotApplicable(intent.id, caseData);
+    const currentDifferentials = updateDifferentials(caseData, askedIntents);
     return json({
       reply: notApplicable,
       intentId: intent.id, type: 'history',
       isDangerous: false, score: 0,
       normalisedText: normText,
       temperamentApplied: temperament,
+      differentials: currentDifferentials,
     });
   }
+
+  // ── UPGRADE 6: Phase tracking check ────────────────────────
+  const phaseWarning = checkPhaseViolation(intent.id, askedIntents, caseData);
+  const phasePenalty = phaseWarning ? 2 : 0;
+  const currentPhase = getCurrentPhase(askedIntents);
+  const intentPhase  = detectIntentPhase(intent.id);
 
   // ── Score the intent ────────────────────────────────────────
   const alreadyAsked = askedIntents.includes(intent.id);
   const isMust       = caseData.scoringMap.mustAsk.includes(intent.id);
   const isShould     = caseData.scoringMap.shouldAsk.includes(intent.id);
-  const points       = alreadyAsked ? 0
+  const basePoints   = alreadyAsked ? 0
     : isMust   ? (caseData.scoringMap.pointsMust  || 15)
     : isShould ? (caseData.scoringMap.pointsBase  || 10)
     : 5;
+  // Subtract phase penalty from earned points (floor at 0)
+  const points = Math.max(0, basePoints - phasePenalty);
 
-  // ── UPGRADE 3: Apply personality to the reply ───────────────
+  // ── UPGRADE 3 + 8: Apply personality + Nigerian patient engine ─
   const isDistressed = DISTRESS_INTENTS.has(intent.id);
   // Simple deterministic RNG seeded by message length + intent id length
   const rng = ((message.length * 7 + intent.id.length * 13) % 100) / 100;
   const wrappedReply = alreadyAsked
     ? responseData.text   // No personality wrapping on repeat questions
-    : applyPersonality(responseData.text, temperament, isDistressed, rng);
+    : generatePatientResponse({
+        baseText:               responseData.text,
+        intentId:               intent.id,
+        studentText:            normText,         // Jargon check runs on normalised input
+        baseTemperament:        temperament,
+        isDistressed,
+        askedIntents,
+        cumulativePenalties:    clientPenalties,  // Passed from frontend state
+        phaseViolationOccurred: !!phaseWarning,
+        rng,
+      });
 
   // ── UPGRADE 4: Fetch knowledge pearl (only for scored intents)
   const pearl = (!alreadyAsked && (isMust || isShould))
     ? await getPearl(intent.id, caseData.diagnosis?.primary, env)
     : null;
 
+  // ── UPGRADE 5: Updated differentials after this intent ──────
+  const askedAfter = alreadyAsked ? askedIntents : [...askedIntents, intent.id];
+  const updatedDifferentials = updateDifferentials(caseData, askedAfter);
+
+  // Build the reply — prepend phase warning if triggered
+  const finalReply = phaseWarning
+    ? `${phaseWarning}\n\n${wrappedReply}`
+    : wrappedReply;
+
   return json({
-    reply: wrappedReply,
+    reply: finalReply,
     intentId: intent.id,
     type: responseData.type || 'history',
     isDangerous: false,
@@ -706,126 +1069,14 @@ async function handleChat(request, env) {
     pearl,
     normalisedText: normText,
     temperamentApplied: temperament,
+    // Phase info
+    phaseWarning: phaseWarning || null,
+    phasePenalty,
+    currentPhase: PHASE_LABELS[currentPhase] || 'History',
+    intentPhase: PHASE_LABELS[intentPhase]   || 'History',
+    // Updated differentials
+    differentials: updatedDifferentials,
   });
-}
-
-// ══════════════════════════════════════════════════════════════
-//  AI — POST /ai
-//  Proxies an AI patient simulation to Anthropic.
-//  Body: { caseId, conversationHistory, askedIntents }
-//  Requires env.ANTHROPIC_API_KEY
-// ══════════════════════════════════════════════════════════════
-
-async function handleAI(request, env) {
-  if (!env.ANTHROPIC_API_KEY) {
-    return err('ANTHROPIC_API_KEY not configured on worker', 503);
-  }
-  const body = await request.json();
-  const { caseId, conversationHistory = [], askedIntents = [] } = body;
-  if (!caseId) return err('caseId required');
-
-  const caseData = await resolveCase(caseId, env);
-  if (!caseData) return err(`Case ${caseId} not found`, 404);
-
-  const p = caseData.patient;
-  const systemPrompt =
-    `You are ${p.name}, a ${p.age}-year-old ${p.sex.toLowerCase()} patient at ${caseData.hospital || 'a Nigerian teaching hospital'}. ` +
-    `Presenting complaint: ${caseData.presentingComplaint}. ` +
-    `You have ${caseData.diagnosis.primary} but you do NOT know your diagnosis. ` +
-    `Answer the doctor's questions naturally, as a real patient would. Keep responses to 1–4 sentences. ` +
-    `If asked about something not relevant to your case, say you don't know or it's not relevant. ` +
-    `Be authentic — use natural speech patterns appropriate for a Nigerian patient.`;
-
-  const anthropicResp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 200,
-      system: systemPrompt,
-      messages: conversationHistory,
-    }),
-  });
-
-  if (!anthropicResp.ok) {
-    const errBody = await anthropicResp.text().catch(() => '');
-    console.error('Anthropic /ai error:', anthropicResp.status, errBody);
-    return err('Upstream AI error', 502);
-  }
-
-  const data = await anthropicResp.json();
-  const reply = data.content?.[0]?.text || "I'm not sure how to answer that.";
-
-  // Also classify intent for scoring hints (non-authoritative — client scores too)
-  const normText = normaliseText(conversationHistory.at(-1)?.content || '');
-  const intent = classifyIntent(normText, INTENT_PATTERNS);
-  let intentId = null, score = 0;
-  if (intent && !askedIntents.includes(intent.id) && caseData.intentMap[intent.id]) {
-    intentId = intent.id;
-    const isMust = caseData.scoringMap.mustAsk.includes(intent.id);
-    const isShould = caseData.scoringMap.shouldAsk.includes(intent.id);
-    score = isMust ? (caseData.scoringMap.pointsMust || 15)
-          : isShould ? (caseData.scoringMap.pointsBase || 10)
-          : 5;
-  }
-
-  return json({ reply, intentId, score });
-}
-
-// ══════════════════════════════════════════════════════════════
-//  AI FEEDBACK — POST /ai-feedback
-//  Generates personalised end-of-case clinical feedback.
-//  Body: { caseId, diagnosis, attempt, correct, askedIntents,
-//          missedMust, netScore, grossScore, penalties, penaltyCount }
-//  Requires env.ANTHROPIC_API_KEY
-// ══════════════════════════════════════════════════════════════
-
-async function handleAIFeedback(request, env) {
-  if (!env.ANTHROPIC_API_KEY) {
-    return err('ANTHROPIC_API_KEY not configured on worker', 503);
-  }
-  const body = await request.json();
-  const {
-    diagnosis, attempt, correct,
-    askedIntents = [], missedMust = [],
-    netScore, grossScore, penalties, penaltyCount,
-  } = body;
-
-  const prompt =
-    `You are a clinical tutor at a Nigerian teaching hospital. ` +
-    `Case diagnosis: ${diagnosis}. ` +
-    `Student asked ${askedIntents.length} questions and ` +
-    `${correct ? 'correctly' : 'incorrectly'} diagnosed (attempt: "${attempt}"). ` +
-    `Net score: ${netScore} (gross ${grossScore}, penalties −${penalties}). ` +
-    `Penalty actions: ${penaltyCount}. ` +
-    `Topics covered: ${askedIntents.slice(0, 8).join(', ') || 'none'}. ` +
-    `Missed key questions: ${missedMust.join(', ') || 'none'}. ` +
-    `Give exactly 3 focused sentences of clinical feedback. ` +
-    `Mention negative marking if penalties > 0. Be specific, warm, and educational. No bullet points.`;
-
-  const anthropicResp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 250,
-      messages: [{ role: 'user', content: prompt }],
-    }),
-  });
-
-  if (!anthropicResp.ok) {
-    return err('Upstream AI error', 502);
-  }
-  const data = await anthropicResp.json();
-  return json({ feedback: data.content?.[0]?.text || '' });
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -917,12 +1168,69 @@ async function handleIngestCases(request, env) {
 async function handleKnowledgeQuery(url, env) {
   const auth = url.searchParams.get('secret');
   if (!env.ADMIN_SECRET || auth !== env.ADMIN_SECRET) return err('Unauthorised', 401);
-  const topic = url.searchParams.get('topic');
-  if (!topic) return err('topic param required');
-  if (!env.KNOWLEDGE_KV) return err('KNOWLEDGE_KV not configured', 500);
-  const raw = await env.KNOWLEDGE_KV.get(`topic:${topic}`);
-  if (!raw) return json({ found: false, topic });
-  return json({ found: true, topic, data: JSON.parse(raw) });
+
+  const topic    = url.searchParams.get('topic');
+  const drug     = url.searchParams.get('drug');
+  const guide    = url.searchParams.get('guideline');
+  const search   = url.searchParams.get('search');   // free-text search across bank
+  const listAll  = url.searchParams.get('list');     // ?list=1 → return all keys
+
+  // ── List all static bank keys ─────────────────────────────────
+  if (listAll) {
+    const keys = Object.keys(STATIC_BANK);
+    return json({
+      found: true,
+      total: keys.length,
+      topics:     keys.filter(k => k.startsWith('topic:')).map(k => k.replace('topic:', '')),
+      pearls:     keys.filter(k => k.startsWith('pearl:')).map(k => k.replace('pearl:', '')),
+      drugs:      keys.filter(k => k.startsWith('drug:')).map(k => k.replace('drug:', '')),
+      guidelines: keys.filter(k => k.startsWith('guideline:')).map(k => k.replace('guideline:', '')),
+    });
+  }
+
+  // ── Free-text search across name + overview ───────────────────
+  if (search) {
+    const needle = search.toLowerCase();
+    const matches = [];
+    for (const [key, val] of Object.entries(STATIC_BANK)) {
+      const haystack = [val.name, val.overview, val.slug].filter(Boolean).join(' ').toLowerCase();
+      if (haystack.includes(needle)) {
+        matches.push({ key, name: val.name, type: key.split(':')[0] });
+      }
+    }
+    return json({ found: matches.length > 0, query: search, results: matches });
+  }
+
+  // ── Drug lookup ───────────────────────────────────────────────
+  if (drug) {
+    const entry = bankLookupDrug(drug);
+    if (entry) return json({ found: true, source: 'static_bank', drug, data: entry });
+    return json({ found: false, drug });
+  }
+
+  // ── Guideline lookup ──────────────────────────────────────────
+  if (guide) {
+    const entry = bankLookupGuideline(guide);
+    if (entry) return json({ found: true, source: 'static_bank', guideline: guide, data: entry });
+    return json({ found: false, guideline: guide });
+  }
+
+  // ── Topic lookup (KV first, then static bank) ─────────────────
+  if (!topic) return err('Provide topic=, drug=, guideline=, search=, or list=1');
+
+  // Try KV
+  if (env.KNOWLEDGE_KV) {
+    try {
+      const raw = await env.KNOWLEDGE_KV.get(`topic:${topic}`);
+      if (raw) return json({ found: true, source: 'kv', topic, data: JSON.parse(raw) });
+    } catch (_) {}
+  }
+
+  // Try static bank
+  const staticEntry = bankLookupTopic(topic);
+  if (staticEntry) return json({ found: true, source: 'static_bank', topic, data: staticEntry });
+
+  return json({ found: false, topic, sources_checked: ['kv', 'static_bank'] });
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1038,23 +1346,84 @@ function generateNotApplicable(intentId, caseData) {
 // ══════════════════════════════════════════════════════════════
 
 async function resolveCase(caseId, env) {
+  let caseData = null;
+
+  // ── 1. KV individual case ──────────────────────────────────────
   if (env.CASES_KV) {
     try {
       const raw = await env.CASES_KV.get(`case:${caseId}`);
-      if (raw) return JSON.parse(raw);
-      // Also try loading from the discipline bulk store
-      const disciplines = ['peds','med','surg','og'];
-      for (const disc of disciplines) {
-        const bulk = await env.CASES_KV.get(`cases:${disc}`);
-        if (bulk) {
-          const arr = JSON.parse(bulk);
-          const found = arr.find(c => c.caseId === caseId);
-          if (found) return found;
-        }
-      }
+      if (raw) caseData = JSON.parse(raw);
     } catch (_) {}
+
+    // ── 2. KV discipline bulk store ───────────────────────────────
+    if (!caseData) {
+      try {
+        const disciplines = ['peds', 'med', 'surg', 'og'];
+        for (const disc of disciplines) {
+          const bulk = await env.CASES_KV.get(`cases:${disc}`);
+          if (bulk) {
+            const arr = JSON.parse(bulk);
+            const found = arr.find(c => c.caseId === caseId);
+            if (found) { caseData = found; break; }
+          }
+        }
+      } catch (_) {}
+    }
   }
-  return BUILTIN_CASES.find(c => c.caseId === caseId) || null;
+
+  // ── 3. Built-in hardcoded cases ───────────────────────────────
+  if (!caseData) {
+    caseData = BUILTIN_CASES.find(c => c.caseId === caseId) || null;
+  }
+
+  if (!caseData) return null;
+
+  // ── 4. Enrich with static knowledge bank ──────────────────────
+  // If the case has a primary diagnosis, pull the matching topic
+  // entry from the static bank and attach useful fields so that
+  // differentials, clinical features, and management pearls are
+  // always available — even for cases that don't define them.
+  const primaryDx = caseData.diagnosis?.primary;
+  if (primaryDx) {
+    const topic = bankLookupTopic(primaryDx);
+    if (topic) {
+      // Attach differentials from bank if case doesn't define its own
+      if (!caseData.differentials?.length && topic.differentials?.length) {
+        caseData.differentials = topic.differentials.map((d, i) => ({
+          name: d.name,
+          initial: Math.max(5, 40 - i * 10), // staggered starting weights
+          color: ['#8A3F6B','#9B3535','#5B3F8A','#2A5A8A','#3F6B3F'][i % 5],
+          distinguishing: d.distinguishing || '',
+        }));
+      }
+
+      // Attach management pearl from bank if case doesn't define one
+      if (!caseData.managementPearl && topic.management_pearls) {
+        caseData.managementPearl = topic.management_pearls;
+      }
+
+      // Attach Nigerian context note if available
+      if (!caseData.nigerianContext && topic.nigerian_context) {
+        caseData.nigerianContext = topic.nigerian_context;
+      }
+
+      // Attach clinical features summary for end-of-case review
+      if (!caseData.clinicalFeaturesSummary && topic.clinical_features) {
+        caseData.clinicalFeaturesSummary = topic.clinical_features;
+      }
+
+      // Attach investigations summary for end-of-case review
+      if (!caseData.investigationsSummary && topic.investigations) {
+        caseData.investigationsSummary = topic.investigations;
+      }
+
+      // Tag so the response layer knows enrichment happened
+      caseData._bankEnriched = true;
+      caseData._bankTopic = topic.slug || topic.name;
+    }
+  }
+
+  return caseData;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1091,6 +1460,159 @@ const GLOBAL_DANGEROUS_PATTERNS = [
     explanation: '⛔ Sedation in a patient with acute respiratory distress can cause respiratory arrest. Contraindicated in acute asthma and any unprotected airway. Deducted −15 pts.',
   },
 ];
+
+// ══════════════════════════════════════════════════════════════
+//  UPGRADE 5 — DYNAMIC DIFFERENTIAL TRACKER
+//  Updates differential probabilities as the student gathers
+//  data. Each intent shifts weights for/against each diagnosis.
+//  Returns a sorted, normalised differential list.
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * DEFAULT_INTENT_WEIGHTS
+ * Fallback weights used when a case doesn't define intentWeights.
+ * Structure: { intentId: { 'Diagnosis Name': deltaWeight } }
+ * Positive = increases probability, negative = decreases.
+ */
+const DEFAULT_INTENT_WEIGHTS = {
+  // History findings that shift differentials generically
+  sr_fever:          { 'Acute Appendicitis': +8, 'Severe Malaria (P. falciparum)': +20, 'Viral Encephalitis': +10, 'Mesenteric Adenitis': +12 },
+  sr_seizures:       { 'Severe Malaria (P. falciparum)': +25, 'Viral Encephalitis': +20, 'Febrile Convulsion': +15 },
+  sr_oedema:         { 'Decompensated Heart Failure': +20, 'Severe Pre-eclampsia': +18, 'Nephrotic Syndrome': +15, 'HELLP Syndrome': +8 },
+  sr_chest_pain:     { 'Decompensated Heart Failure': +10, 'Pulmonary Embolism': +15, 'COPD Exacerbation': +8 },
+  hpc_character:     { 'Acute Appendicitis': +15, 'Decompensated Heart Failure': +10 },
+  hpc_triggers:      { 'Acute Asthma Exacerbation': +20, 'COPD Exacerbation': +12 },
+  hpc_orthopnoea:    { 'Decompensated Heart Failure': +22, 'COPD Exacerbation': +8, 'Pulmonary Embolism': +5 },
+  pmh_general:       { 'Decompensated Heart Failure': +10, 'COPD Exacerbation': +8 },
+  meds_general:      { 'Acute Asthma Exacerbation': +10, 'Decompensated Heart Failure': +10 },
+  antenatal:         { 'Severe Pre-eclampsia': +15, 'Gestational Hypertension': +12, 'HELLP Syndrome': +8 },
+  parity:            { 'Severe Pre-eclampsia': +10 },
+  // Examination findings
+  exam_general:      { 'Severe Malaria (P. falciparum)': +10, 'Severe Acute Malnutrition': +10 },
+  exam_cardiovascular:{ 'Decompensated Heart Failure': +20, 'Constrictive Pericarditis': +10 },
+  exam_chest:        { 'Acute Asthma Exacerbation': +18, 'Decompensated Heart Failure': +15, 'COPD Exacerbation': +12 },
+  exam_neuro:        { 'Severe Malaria (P. falciparum)': +15, 'Viral Encephalitis': +18, 'Severe Pre-eclampsia': +20 },
+  exam_specific_signs:{ 'Acute Appendicitis': +20 },
+  // Investigation findings
+  ix_fbc:            { 'Severe Malaria (P. falciparum)': +12, 'Decompensated Heart Failure': +8, 'HELLP Syndrome': +10 },
+  ix_rdt:            { 'Severe Malaria (P. falciparum)': +30, 'Viral Encephalitis': -15, 'Bacterial Meningitis': -10 },
+  ix_thickfilm:      { 'Severe Malaria (P. falciparum)': +25 },
+  ix_lft:            { 'HELLP Syndrome': +20, 'Decompensated Heart Failure': +10 },
+  ix_urinalysis:     { 'Severe Pre-eclampsia': +20, 'Gestational Hypertension': +8 },
+  ix_ecg:            { 'Decompensated Heart Failure': +15, 'Pulmonary Embolism': +10 },
+  ix_cxr:            { 'Decompensated Heart Failure': +15, 'Acute Asthma Exacerbation': +10, 'COPD Exacerbation': +10 },
+  ix_pefr:           { 'Acute Asthma Exacerbation': +22, 'COPD Exacerbation': +10 },
+  ix_abg:            { 'Acute Asthma Exacerbation': +15, 'COPD Exacerbation': +12 },
+  ix_ultrasound:     { 'Severe Pre-eclampsia': +12, 'HELLP Syndrome': +10 },
+};
+
+/**
+ * updateDifferentials(caseData, askedIntents)
+ * Returns the differential list with recalculated probabilities
+ * based on which intents the student has covered so far.
+ */
+function updateDifferentials(caseData, askedIntents) {
+  if (!caseData.differentials || caseData.differentials.length === 0) return [];
+
+  // Clone so we don't mutate the case definition
+  const diffs = caseData.differentials.map(d => ({ ...d }));
+
+  // Use case-specific weights if defined, else DEFAULT_INTENT_WEIGHTS
+  const weights = caseData.intentWeights || DEFAULT_INTENT_WEIGHTS;
+
+  let total = 0;
+  diffs.forEach(d => {
+    let w = d.initial ?? 25;
+    for (const intentId of askedIntents) {
+      const intentDeltas = weights[intentId];
+      if (!intentDeltas) continue;
+      // Match on full name (case-insensitive)
+      for (const [diagName, delta] of Object.entries(intentDeltas)) {
+        if (d.name.toLowerCase() === diagName.toLowerCase()) {
+          w += delta;
+        }
+      }
+    }
+    d.weight = Math.max(1, w); // floor at 1 so nothing fully disappears
+    total += d.weight;
+  });
+
+  diffs.forEach(d => {
+    d.probability = Math.round((d.weight / total) * 100);
+  });
+
+  return diffs.sort((a, b) => b.probability - a.probability);
+}
+
+// ══════════════════════════════════════════════════════════════
+//  UPGRADE 6 — PHASE TRACKING & PROGRESSIVE SCORING
+//  Enforces HISTORY → EXAM → INVESTIGATION clinical workflow.
+//  Detects phase regression and rewards logical progression.
+// ══════════════════════════════════════════════════════════════
+
+const PHASES = { HISTORY: 1, EXAM: 2, INVESTIGATION: 3 };
+
+const PHASE_LABELS = { 1: 'History', 2: 'Examination', 3: 'Investigation' };
+
+/**
+ * detectIntentPhase(intentId)
+ * Returns which clinical phase an intent belongs to.
+ */
+function detectIntentPhase(intentId) {
+  if (!intentId) return null;
+  if (intentId.startsWith('exam_')) return PHASES.EXAM;
+  if (intentId.startsWith('ix_'))   return PHASES.INVESTIGATION;
+  // Everything else is history (hpc_, sr_, pmh_, shx_, fhx_, meds_, parity, antenatal, immunisation…)
+  return PHASES.HISTORY;
+}
+
+/**
+ * getCurrentPhase(askedIntents)
+ * Derives the student's current phase from what they've asked so far.
+ * Returns the highest phase they've entered.
+ */
+function getCurrentPhase(askedIntents) {
+  let phase = PHASES.HISTORY;
+  for (const id of askedIntents) {
+    const p = detectIntentPhase(id);
+    if (p && p > phase) phase = p;
+  }
+  return phase;
+}
+
+/**
+ * checkPhaseViolation(intentId, askedIntents, caseData)
+ * Returns a warning string if the student is skipping phases,
+ * or null if progression is appropriate.
+ */
+function checkPhaseViolation(intentId, askedIntents, caseData) {
+  const intentPhase = detectIntentPhase(intentId);
+  if (!intentPhase) return null;
+
+  // Count how many mustAsk history intents have been covered
+  const mustAskHistory = (caseData.scoringMap?.mustAsk || [])
+    .filter(id => detectIntentPhase(id) === PHASES.HISTORY);
+  const coveredMustHistory = mustAskHistory
+    .filter(id => askedIntents.includes(id)).length;
+
+  // Jumping straight to EXAM without any history
+  if (intentPhase === PHASES.EXAM && askedIntents.length === 0) {
+    return `⚠️ *Clinical tutor note:* You've started with examination before taking any history. Always begin with a focused history — this is a core clinical habit. (-2 pts deducted)`;
+  }
+
+  // Jumping straight to INVESTIGATION without any exam
+  const hasExam = askedIntents.some(id => detectIntentPhase(id) === PHASES.EXAM);
+  if (intentPhase === PHASES.INVESTIGATION && !hasExam) {
+    return `⚠️ *Clinical tutor note:* You've moved to investigations before performing any clinical examination. Investigations should follow history AND examination. (-2 pts deducted)`;
+  }
+
+  // Jumped into EXAM or INVESTIGATION before covering critical history
+  if (intentPhase >= PHASES.EXAM && mustAskHistory.length > 0 && coveredMustHistory === 0) {
+    return `⚠️ *Clinical tutor note:* You have not yet asked about the key features of the presenting complaint. Ensure your history is complete before proceeding. (-2 pts deducted)`;
+  }
+
+  return null;
+}
 
 // ══════════════════════════════════════════════════════════════
 //  INTENT PATTERN LIBRARY
@@ -1210,8 +1732,7 @@ const INTENT_PATTERNS = [
 const BUILTIN_CASES = [
   {
     caseId: 'case_surg_appendicitis_001',
-    discipline: 'surg', specialty: 'surgery', difficulty: 'intermediate',
-    timeLimit: 600, estimatedMinutes: 10,
+    discipline: 'surg', difficulty: 'intermediate', timeLimit: 600,
     hospital: 'LUTH Lagos',
     patient: { name: 'Chidi Nwosu', age: 19, sex: 'Male', occupation: 'University Student', avatar: '🧑' },
     presentingComplaint: 'Severe right-sided abdominal pain for 18 hours',
@@ -1250,8 +1771,7 @@ const BUILTIN_CASES = [
   },
   {
     caseId: 'case_peds_malaria_001',
-    discipline: 'peds', specialty: 'paediatrics', difficulty: 'beginner',
-    timeLimit: 480, estimatedMinutes: 8,
+    discipline: 'peds', difficulty: 'beginner', timeLimit: 480,
     hospital: 'UCH Ibadan',
     patient: { name: 'Emeka Adeyemi', age: 4, sex: 'Male', occupation: 'Pre-school', avatar: '👦' },
     presentingComplaint: 'High fever, vomiting and drowsiness for 2 days',
@@ -1292,8 +1812,7 @@ const BUILTIN_CASES = [
   },
   {
     caseId: 'case_peds_asthma_001',
-    discipline: 'peds', specialty: 'paediatrics', difficulty: 'beginner',
-    timeLimit: 480, estimatedMinutes: 8,
+    discipline: 'peds', difficulty: 'beginner', timeLimit: 480,
     hospital: 'LUTH Lagos',
     patient: { name: 'Adaeze Obi', age: 8, sex: 'Female', occupation: 'Primary school', avatar: '👧' },
     presentingComplaint: 'Wheezing and difficulty breathing for 4 hours',
@@ -1327,8 +1846,7 @@ const BUILTIN_CASES = [
   },
   {
     caseId: 'case_og_preeclampsia_001',
-    discipline: 'og', specialty: 'obstetrics', difficulty: 'hard',
-    timeLimit: 720, estimatedMinutes: 12,
+    discipline: 'og', difficulty: 'hard', timeLimit: 720,
     hospital: 'LASUTH Ikeja',
     patient: { name: 'Fatima Bello', age: 26, sex: 'Female', occupation: 'Trader', avatar: '🤰' },
     presentingComplaint: 'Headache and swollen legs at 34 weeks gestation',
@@ -1367,8 +1885,7 @@ const BUILTIN_CASES = [
   },
   {
     caseId: 'case_med_hf_001',
-    discipline: 'med', specialty: 'cardiology', difficulty: 'hard',
-    timeLimit: 720, estimatedMinutes: 12,
+    discipline: 'med', difficulty: 'hard', timeLimit: 720,
     hospital: 'UCH Ibadan',
     patient: { name: 'Emmanuel Okafor', age: 58, sex: 'Male', occupation: 'Retired Civil Servant', avatar: '👴' },
     presentingComplaint: 'Worsening breathlessness and ankle swelling for 3 weeks',
