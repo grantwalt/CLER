@@ -890,9 +890,24 @@ function serialiseCases(cases) {
   }));
 }
 
+// ── BUNDLED_DISCIPLINES ────────────────────────────────────────
+// Disciplines whose cases are bundled at deploy time via JSON
+// imports. KV is intentionally bypassed for these — the repo
+// is the single source of truth. KV is only consulted for
+// disciplines NOT in this set (dynamically ingested extras).
+const BUNDLED_DISCIPLINES = new Set(['peds']);
+
 async function handleCases(url, env) {
   const discipline = url.searchParams.get('discipline');
   if (!discipline) return err('discipline param required');
+
+  // Always serve bundled cases for file-backed disciplines
+  if (BUNDLED_DISCIPLINES.has(discipline)) {
+    const cases = BUILTIN_CASES.filter(c => c.discipline === discipline);
+    return json({ cases: serialiseCases(cases), source: 'builtin', count: cases.length });
+  }
+
+  // For non-bundled disciplines, try KV first then fall back to builtins
   if (env.CASES_KV) {
     const raw = await env.CASES_KV.get(`cases:${discipline}`);
     if (raw) {
@@ -1349,8 +1364,18 @@ function generateNotApplicable(intentId, caseData) {
 async function resolveCase(caseId, env) {
   let caseData = null;
 
-  // ── 1. KV individual case ──────────────────────────────────────
-  if (env.CASES_KV) {
+  // ── 0. Bundled disciplines — always resolve from BUILTIN_CASES ──
+  // Skip KV entirely for peds (and any future bundled discipline)
+  // so the repo JSON is always the source of truth.
+  const isBundled = BUILTIN_CASES.some(
+    c => c.caseId === caseId && BUNDLED_DISCIPLINES.has(c.discipline)
+  );
+  if (isBundled) {
+    caseData = BUILTIN_CASES.find(c => c.caseId === caseId) || null;
+  }
+
+  // ── 1. KV individual case (non-bundled disciplines only) ────────
+  if (!caseData && env.CASES_KV) {
     try {
       const raw = await env.CASES_KV.get(`case:${caseId}`);
       if (raw) caseData = JSON.parse(raw);
@@ -1359,7 +1384,7 @@ async function resolveCase(caseId, env) {
     // ── 2. KV discipline bulk store ───────────────────────────────
     if (!caseData) {
       try {
-        const disciplines = ['peds', 'med', 'surg', 'og'];
+        const disciplines = ['med', 'surg', 'og']; // peds excluded — bundled
         for (const disc of disciplines) {
           const bulk = await env.CASES_KV.get(`cases:${disc}`);
           if (bulk) {
@@ -1372,7 +1397,7 @@ async function resolveCase(caseId, env) {
     }
   }
 
-  // ── 3. Built-in hardcoded cases ───────────────────────────────
+  // ── 3. Built-in fallback (surg, og, med hardcoded cases) ────────
   if (!caseData) {
     caseData = BUILTIN_CASES.find(c => c.caseId === caseId) || null;
   }
