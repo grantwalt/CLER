@@ -93,7 +93,8 @@
 //  Lookup order in getPearl(): KV → static bank → BUILTIN_PEARLS.
 //  To add more disciplines: import and merge below.
 // ══════════════════════════════════════════════════════════════
-import pedsBank from './knowledge/peds_knowledge_bank.json';
+import pedsBank  from './knowledge/peds_knowledge_bank.json';
+import pedsCases from './knowledge/cases/peds_cases.json';
 
 /**
  * STATIC_BANK
@@ -1769,81 +1770,8 @@ const BUILTIN_CASES = [
     },
     scoringMap: { mustAsk: ['hpc_onset','hpc_character','sr_fever','exam_abdomen'], shouldAsk: ['sr_nausea','exam_specific_signs','ix_fbc','ix_ultrasound'], pointsBase: 5, pointsMust: 15 },
   },
-  {
-    caseId: 'case_peds_malaria_001',
-    discipline: 'peds', difficulty: 'beginner', timeLimit: 480,
-    hospital: 'UCH Ibadan',
-    patient: { name: 'Emeka Adeyemi', age: 4, sex: 'Male', occupation: 'Pre-school', avatar: '👦' },
-    presentingComplaint: 'High fever, vomiting and drowsiness for 2 days',
-    diagnosis: { primary: 'Severe Malaria (P. falciparum)', keywords: ['malaria','severe malaria','cerebral malaria','falciparum malaria','plasmodium falciparum'] },
-    differentials: [
-      { name: 'Severe Malaria',       color: '#1A7A6E', initial: 40 },
-      { name: 'Bacterial Meningitis', color: '#9B3535', initial: 25 },
-      { name: 'Typhoid Encephalopathy', color: '#B86A10', initial: 20 },
-      { name: 'Viral Encephalitis',   color: '#5B3F8A', initial: 15 },
-    ],
-    trapActions: [
-      { pattern: /aspirin/i,                                       penalty: 20, explanation: "⛔ Aspirin is contraindicated in children — risk of Reye's syndrome. Deducted −20 pts." },
-      { pattern: /chloroquine/i,                                   penalty: 15, explanation: '⚠️ Chloroquine-resistant P. falciparum is widespread in Nigeria. First-line is IV artesunate for severe malaria. Deducted −15 pts.' },
-      { pattern: /lumbar puncture.*without|lp.*before.*stabiliz/i, penalty: 15, explanation: '⚠️ LP should only be performed after stabilising the patient and ruling out raised ICP clinically. Deducted −15 pts.' },
-    ],
-    intentMap: {
-      hpc_onset:       { text: "He started with fever 2 days ago — very high. Yesterday he began vomiting and became drowsy. This morning I couldn't wake him properly.", type:'history', label:'Onset' },
-      hpc_character:   { text: 'The fever came suddenly and is very high — I could feel the heat from his body. He\'s also been shivering at times.', type:'history', label:'Fever character' },
-      sr_fever:        { text: "Yes, very high fever — 39.8°C when we checked. With rigors earlier. It went down slightly with paracetamol but came back.", type:'history', label:'Fever' },
-      sr_seizures:     { text: "Yes! He had one fit this morning — he shook all over for about 2–3 minutes. He was confused afterwards.", type:'history', label:'Seizures' },
-      sr_consciousness:{ text: "He was alert before, but now he's very drowsy — I have to shake him to wake him. He doesn't recognise me properly.", type:'history', label:'Consciousness' },
-      sr_jaundice:     { text: "His eyes looked slightly yellow since yesterday. I wasn't sure if I was imagining it.", type:'history', label:'Jaundice' },
-      sr_nausea:       { text: "He has vomited 5–6 times today. He can't keep anything down — not even water.", type:'history', label:'Vomiting' },
-      shx_travel:      { text: "We live in Ibadan. Last week we visited relatives in a village near Abeokuta — they have a lot of mosquitoes there.", type:'history', label:'Travel/exposure' },
-      pmh_general:     { text: "He had malaria once before at age 2. No other serious illness. He was born well — no complications.", type:'history', label:'Past medical history' },
-      immunisation:    { text: "He is up to date on his EPI vaccines. He received the R21 malaria vaccine at age 1.", type:'history', label:'Immunisation' },
-      meds_general:    { text: "We gave him paracetamol syrup. That's all — nothing else.", type:'history', label:'Medications' },
-      exam_general:    { text: 'General: Very drowsy, responds only to pain. GCS 10/15 (E3V3M4). Temp 39.6°C. Pulse 138 bpm. BP 90/60. RR 38. SpO₂ 94%. Pallor ++. Icteric sclerae. Severe dehydration.', type:'exam', label:'General examination' },
-      exam_neuro:      { text: "Neuro: GCS 10. Does not follow commands. Pupils equal and reactive (3mm). Neck: mild stiffness — equivocal. No clonus. Plantar: equivocal.", type:'exam', label:'Neurological examination' },
-      exam_abdomen:    { text: "Abdomen: Soft. Liver palpable 4cm below costal margin — hepatomegaly. Spleen palpable 3cm — splenomegaly. No ascites.", type:'exam', label:'Abdominal examination' },
-      exam_skin:       { text: "Skin: Pallor ++ (conjunctivae very pale). Mild jaundice. No petechiae or rash. Poor skin turgor (dehydration).", type:'exam', label:'Skin examination' },
-      ix_rdt:          { text: 'Malaria RDT:\n• P. falciparum antigen: POSITIVE\n• Non-falciparum species: Negative\n→ Confirms falciparum malaria.', type:'investigation', label:'Malaria RDT' },
-      ix_thickfilm:    { text: 'Blood Film (thick & thin):\n• P. falciparum trophozoites and gametocytes identified\n• Parasitaemia: 4.8% (hyperparasitaemia — severe malaria threshold is >2%)\n→ Severe falciparum malaria confirmed.', type:'investigation', label:'Blood film' },
-      ix_fbc:          { text: 'FBC:\n• Hb: 5.8 g/dL ↓↓ (severe anaemia)\n• WBC: 14.2 × 10⁹/L ↑ (reactive)\n• Platelets: 48 × 10⁹/L ↓ (thrombocytopaenia — typical in malaria)', type:'investigation', label:'FBC' },
-      ix_lft:          { text: 'Renal/Metabolic:\n• Blood glucose: 2.1 mmol/L ↓↓ (HYPOGLYCAEMIA — requires urgent dextrose)\n• Creatinine: 94 μmol/L (normal)\n• Bilirubin: 68 μmol/L ↑ (haemolysis)\n• Na: 130 mmol/L ↓', type:'investigation', label:'Metabolic panel' },
-    },
-    scoringMap: { mustAsk: ['sr_fever','sr_consciousness','shx_travel','ix_rdt'], shouldAsk: ['sr_seizures','sr_jaundice','ix_thickfilm','ix_fbc','exam_neuro'], pointsBase: 5, pointsMust: 15 },
-  },
-  {
-    caseId: 'case_peds_asthma_001',
-    discipline: 'peds', difficulty: 'beginner', timeLimit: 480,
-    hospital: 'LUTH Lagos',
-    patient: { name: 'Adaeze Obi', age: 8, sex: 'Female', occupation: 'Primary school', avatar: '👧' },
-    presentingComplaint: 'Wheezing and difficulty breathing for 4 hours',
-    diagnosis: { primary: 'Acute Asthma Exacerbation', keywords: ['asthma','acute asthma','asthma attack','bronchial asthma','asthma exacerbation'] },
-    differentials: [
-      { name: 'Acute Asthma Exacerbation', color: '#1A7A6E', initial: 50 },
-      { name: 'Bronchiolitis',             color: '#5B3F8A', initial: 15 },
-      { name: 'Pneumonia',                 color: '#9B3535', initial: 20 },
-      { name: 'Foreign Body Aspiration',   color: '#B86A10', initial: 15 },
-    ],
-    trapActions: [
-      { pattern: /beta.?blocker|propranolol|atenolol/i, penalty: 20, explanation: '⛔ Beta-blockers are absolutely contraindicated in asthma — they cause fatal bronchospasm. Deducted −20 pts.' },
-      { pattern: /sedative|sedation|diazepam|lorazepam.*asthma/i, penalty: 15, explanation: '⛔ Sedation in a patient with acute respiratory distress can cause respiratory arrest. Deducted −15 pts.' },
-    ],
-    intentMap: {
-      hpc_onset:    { text: "She started wheezing about 4 hours ago after playing football at school. The breathing has been getting worse since then.", type:'history', label:'Onset & trigger' },
-      hpc_triggers: { text: "Exercise seems to trigger it. She also gets worse when she's around dust or her uncle's cat. Cold air makes it worse too.", type:'history', label:'Triggers' },
-      pmh_general:  { text: "She has had asthma since age 4. She's been admitted twice before — once needed nebulisers in A&E. She also has eczema.", type:'history', label:'Past medical history' },
-      meds_general: { text: "She uses a blue inhaler (Salbutamol) when needed. She has a brown inhaler (Beclomethasone) but forgets to use it most days. She's already used her blue inhaler 6 times today with only partial relief.", type:'history', label:'Medications' },
-      fhx_general:  { text: "Her father has asthma and her older brother has hay fever. Atopy runs in the family.", type:'history', label:'Family history' },
-      shx_general:  { text: "She lives in a flat. We have carpets and a cat at home. She's in primary school — doing well. No smoking in the house.", type:'history', label:'Social history' },
-      sr_fever:     { text: "No fever. Temperature is normal — 37.1°C.", type:'history', label:'Fever' },
-      hpc_character:{ text: "She's wheezing and can't complete sentences — she speaks in phrases. She says her chest feels \"tight like something is squeezing it.\"", type:'history', label:'Symptoms' },
-      exam_general: { text: 'General: Alert but distressed. Speaking in short phrases. Using accessory muscles — intercostal and subcostal recession. RR 36/min. Pulse 128 bpm. Temp 37.1°C. SpO₂ 91% on air.', type:'exam', label:'General examination' },
-      exam_chest:   { text: 'Chest: Hyperinflated. Bilateral expiratory wheeze throughout — polyphonic. Reduced air entry at both bases. No crackles. Percussion: resonant bilaterally.', type:'exam', label:'Chest examination' },
-      ix_pefr:      { text: 'PEFR: 45% predicted for height/age.\n→ <50% predicted = Severe asthma attack (BTS criteria).\n(Predicted PEFR for 8-year-old female, 125cm: ~200 L/min. Measured: ~90 L/min)', type:'investigation', label:'PEFR' },
-      ix_abg:       { text: 'ABG (on air):\n• pH: 7.33 (mild acidosis)\n• PaO₂: 7.8 kPa ↓ (hypoxia)\n• PaCO₂: 5.2 kPa (NORMAL in severe asthma = PRE-ARREST sign)\n→ Life-threatening — a normal or rising CO₂ in acute asthma is an emergency.', type:'investigation', label:'ABG' },
-      ix_cxr:       { text: 'CXR:\n• Hyperinflation — 9 posterior ribs visible\n• Flattened diaphragm\n• No consolidation\n• No pneumothorax\n→ Consistent with severe asthma.', type:'investigation', label:'CXR' },
-    },
-    scoringMap: { mustAsk: ['hpc_triggers','pmh_general','meds_general','exam_chest'], shouldAsk: ['ix_pefr','ix_abg','fhx_general','exam_general'], pointsBase: 5, pointsMust: 15 },
-  },
+  // ── Paediatrics cases — loaded from ./knowledge/cases/peds_cases.json ──
+  ...pedsCases.cases,
   {
     caseId: 'case_og_preeclampsia_001',
     discipline: 'og', difficulty: 'hard', timeLimit: 720,
