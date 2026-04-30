@@ -1145,11 +1145,29 @@ function getRevealedIntents(conversationHistory) {
 }
 
 /**
- * countIntentAsks(intentId, conversationHistory)
+ * countIntentAsks(intentId, conversationHistory, askedIntents)
  * How many times has this exact intent been asked before?
+ *
+ * Uses askedIntents array (always sent by frontend) as the primary
+ * counter. conversationHistory intentId tags are used as a secondary
+ * check if available. askedIntents is a Set on the client so it only
+ * tells us IF it was asked, not HOW MANY TIMES — we use
+ * conversationHistory length filtered by intentId for true count,
+ * but fall back to: 0 = not in askedIntents, 1 = in askedIntents
+ * (first repeat), escalating by conversationHistory if tagged.
  */
-function countIntentAsks(intentId, conversationHistory) {
-  return (conversationHistory || []).filter(t => t.intentId === intentId).length;
+function countIntentAsks(intentId, conversationHistory, askedIntents) {
+  // Primary: count tagged turns in conversationHistory (most accurate)
+  const historyCount = (conversationHistory || [])
+    .filter(t => t.intentId === intentId).length;
+
+  if (historyCount > 0) return historyCount;
+
+  // Secondary: if askedIntents includes this id, it's been asked at least once
+  // before this current request — so this is a repeat (count = 1)
+  if (askedIntents && askedIntents.includes(intentId)) return 1;
+
+  return 0;
 }
 
 /**
@@ -1260,22 +1278,9 @@ function selectTemplate(intentId, temperament, isDistressed, rng) {
 //  for legacy intents.
 // ══════════════════════════════════════════════════════════════
 
-/**
- * generateConversation(opts) → string
- *
- * Pipeline:
- *   1. Revelation gating     → check if tier text overrides template
- *   2. Template selection    → pick sentence template by temperament+hash
- *   3. Slot filling          → inject fact values into template
- *   4. Back-reference        → prepend cross-reference connector if relevant
- *   5. Nigerian context      → probabilistic openers / self-med / faith
- *   6. Personality wrap      → temperament openings/closings
- *   7. Progressive fatigue   → repeat-ask tone adjustment
- *   8. Jargon guard          → override if student used medical jargon
- */
 function generateConversation({
-  facts,                   // symptomFacts[intentId] — may be null
-  baseText,                // legacy intentMap text — fallback
+  facts,
+  baseText,
   intentId,
   studentText,
   baseTemperament,
@@ -1286,45 +1291,58 @@ function generateConversation({
   phaseViolationOccurred = false,
   rng,
 }) {
-  // ── Step 1: Dynamic temperament drift (from Upgrade 8) ──────
+  // ── Step 1: Dynamic temperament drift ───────────────────────
   const dynamicTemperament = shiftTemperament(
     baseTemperament, cumulativePenalties, phaseViolationOccurred);
 
   let reply;
 
+  // askCount uses BOTH conversationHistory intentId tags (accurate after
+  // frontend fix) AND askedIntents array (reliable fallback before fix)
+  const askCount = countIntentAsks(intentId, conversationHistory, askedIntents);
+
   if (facts) {
-    // ── Step 2: Revelation gating ──────────────────────────────
-    const tieredText = selectRevealTier(intentId, conversationHistory, facts);
-
-    if (tieredText) {
-      // Tier text is complete — still apply cultural + personality
-      reply = tieredText;
+    // ── Step 2: Tier-first resolution ───────────────────────────
+    if (askCount === 0 && facts.tier1) {
+      reply = facts.tier1;
+    } else if (askCount === 1 && facts.tier2) {
+      reply = facts.tier2;
+    } else if (askCount >= 2 && facts.tier3) {
+      reply = `(Sighs) ${facts.tier3}`;
+    } else if (askCount >= 2 && facts.tier2) {
+      reply = `I already told you — ${facts.tier2}`;
+    } else if (facts.tier1) {
+      reply = facts.tier1;
     } else {
-      // ── Step 3: Template selection ─────────────────────────────
-      const template = selectTemplate(intentId, dynamicTemperament, isDistressed, rng);
-
-      // ── Step 4: Slot filling ────────────────────────────────────
-      reply = fillSlots(template, facts);
+      // Facts exist but no tier text — use context or template
+      if (facts.context) {
+        reply = facts.context;
+      } else {
+        const template = selectTemplate(intentId, dynamicTemperament, isDistressed, rng);
+        reply = fillSlots(template, facts);
+      }
     }
 
-    // ── Step 5: Back-reference connector ───────────────────────
-    const backRef = buildBackReference(intentId, conversationHistory, rng);
-    if (backRef && reply && !tieredText) {
-      reply = backRef + reply.charAt(0).toLowerCase() + reply.slice(1);
+    // ── Step 3: Back-reference (first ask only, history intents) ─
+    if (askCount === 0 && !intentId.startsWith('exam_') && !intentId.startsWith('ix_')) {
+      const backRef = buildBackReference(intentId, conversationHistory, rng);
+      if (backRef && reply) {
+        reply = backRef + reply.charAt(0).toLowerCase() + reply.slice(1);
+      }
     }
 
   } else {
-    // ── No facts — fall back to legacy v5.0 pipeline ───────────
+    // ── No facts — legacy v5.0 pipeline ────────────────────────
     reply = applyPersonality(baseText, dynamicTemperament, isDistressed, rng);
   }
 
-  // ── Step 6: Progressive fatigue ─────────────────────────────
+  // ── Step 4: Progressive fatigue (repeat-ask marker) ─────────
   reply = applyProgressiveDisclosure(reply, intentId, askedIntents);
 
-  // ── Step 7: Nigerian cultural context ───────────────────────
+  // ── Step 5: Nigerian cultural context ───────────────────────
   reply = injectNigerianContext(reply, intentId, rng);
 
-  // ── Step 8: Jargon confusion guard ──────────────────────────
+  // ── Step 6: Jargon confusion guard ──────────────────────────
   reply = handleJargonResponse(studentText, reply);
 
   return reply;
