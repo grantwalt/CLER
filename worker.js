@@ -530,6 +530,23 @@ async function getPearl(intentId, diagnosisPrimary, env) {
 // ══════════════════════════════════════════════════════════════
 
 async function handleHealth(env) {
+  // Test Supabase connectivity
+  let supabaseStatus = 'not configured';
+  if (env.SUPABASE_URL && env.SUPABASE_ANON_KEY) {
+    try {
+      const resp = await fetch(`${env.SUPABASE_URL}/functions/v1/get-answer?caseId=test&question=test`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${env.SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      supabaseStatus = resp.ok ? 'connected' : `error ${resp.status}`;
+    } catch (e) {
+      supabaseStatus = `unreachable: ${e.message}`;
+    }
+  }
+
   return json({
     status: 'online',
     engine: 'ClerkAI Medical Engine v2.0 — Offline Clinical Reasoning Simulator',
@@ -540,6 +557,12 @@ async function handleHealth(env) {
       cases: !!env.CASES_KV,
       scores: !!env.SCORES_KV,
       knowledge: !!env.KNOWLEDGE_KV,
+    },
+    supabase: {
+      status: supabaseStatus,
+      url: env.SUPABASE_URL
+        ? env.SUPABASE_URL.replace(/https?:\/\//, '').split('.')[0] + '.supabase.co'
+        : null,
     },
   });
 }
