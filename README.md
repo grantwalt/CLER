@@ -1,2 +1,2 @@
 # CLER
-Study app 
+Study app
