@@ -3,6 +3,11 @@
   "main": "worker.js",
   "compatibility_date": "2025-01-01",
   "workers_dev": true,
+
+  "vars": {
+    "SUPABASE_URL": "https://wxmgtugqiisnojqbezby.supabase.co"
+  },
+
   "kv_namespaces": [
     {
       "binding": "CASES_KV",
