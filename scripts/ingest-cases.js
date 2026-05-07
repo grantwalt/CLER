@@ -1,4 +1,3 @@
-
 /**
  * ClerkAI — KV Case Ingest Script
  * 
@@ -20,17 +19,13 @@ const path = require('path');
 
 const API_TOKEN     = process.env.CLOUDFLARE_API_TOKEN;
 const ACCOUNT_ID    = process.env.CLOUDFLARE_ACCOUNT_ID;
-const KV_NAMESPACE  = process.env.KV_NAMESPACE_ID || 'cdea5b79bd5d40f68392b9218db77e17'; // CASES_KV id from wrangler.toml
+const KV_NAMESPACE  = process.env.KV_NAMESPACE_ID;
 
-if (!API_TOKEN)  { console.error('Missing CLOUDFLARE_API_TOKEN'); process.exit(1); }
-if (!ACCOUNT_ID) { console.error('Missing CLOUDFLARE_ACCOUNT_ID'); process.exit(1); }
+if (!API_TOKEN)    { console.error('Missing CLOUDFLARE_API_TOKEN'); process.exit(1); }
+if (!ACCOUNT_ID)   { console.error('Missing CLOUDFLARE_ACCOUNT_ID'); process.exit(1); }
+if (!KV_NAMESPACE) { console.error('Missing KV_NAMESPACE_ID'); process.exit(1); }
 
 const BASE_URL = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE}`;
-
-const headers = {
-  'Authorization': `Bearer ${API_TOKEN}`,
-  'Content-Type':  'application/json',
-};
 
 // ── Write a single KV entry ────────────────────────────────────
 async function kvPut(key, value) {
@@ -102,6 +97,10 @@ async function main() {
 
   // Write individual cases: case:{caseId}
   for (const c of allCases) {
+    if (!c.caseId) {
+      console.error('  ✗ Skipping case with missing caseId:', JSON.stringify(c).slice(0, 80));
+      continue;
+    }
     const key = `case:${c.caseId}`;
     try {
       await kvPut(key, c);
