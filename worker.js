@@ -673,6 +673,13 @@ async function handleChat(request, env, ctx) {
   // ── UPGRADE 3: Assign temperament ──────────────────────────
   const temperament = assignTemperament(caseData.patient);
 
+  // ── Extract case symptom profile ────────────────────────────
+  // Used for symptom-aware universal reply matching
+  const caseSymptoms = Array.isArray(caseData.symptoms)
+    ? caseData.symptoms.map(s => s.toLowerCase())
+    : [];
+  const caseDiscipline = caseData.discipline ?? null;
+
   // ── Classify single intent ──────────────────────────────────
   const intent = classifyIntent(normText, INTENT_PATTERNS);
   if (!intent) {
@@ -687,7 +694,7 @@ async function handleChat(request, env, ctx) {
         }
       }
       // Check Supabase reply_bank
-      const cachedAnswer = await supabaseGetAnswer(caseId, message, env);
+      const cachedAnswer = await supabaseGetAnswer(caseId, message, env, caseSymptoms, caseDiscipline);
       if (cachedAnswer) {
         // Backfill Worker KV for next time
         if (env.CASES_KV && ctx) {
@@ -706,9 +713,9 @@ async function handleChat(request, env, ctx) {
         discipline: caseData.discipline,
       };
       if (ctx) {
-        ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, temperament, env));
+        ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, temperament, env, caseSymptoms));
       } else {
-        supabaseAskQuestion(caseId, message, caseCtx, temperament, env).catch(() => {});
+        supabaseAskQuestion(caseId, message, caseCtx, temperament, env, caseSymptoms).catch(() => {});
       }
     }
     // Return contextual fallback immediately — student never waits
@@ -733,7 +740,7 @@ async function handleChat(request, env, ctx) {
           return json({ reply: kvHit, intentId: intent.id, type: 'cached', isDangerous: false, score: 0, source: 'worker_kv' });
         }
       }
-      const cachedAnswer = await supabaseGetAnswer(caseId, message, env);
+      const cachedAnswer = await supabaseGetAnswer(caseId, message, env, caseSymptoms, caseDiscipline);
       if (cachedAnswer) {
         if (env.CASES_KV && ctx) {
           ctx.waitUntil(env.CASES_KV.put(kvKey, cachedAnswer, { expirationTtl: 86400 * 7 }));
@@ -751,9 +758,9 @@ async function handleChat(request, env, ctx) {
         discipline: caseData.discipline,
       };
       if (ctx) {
-        ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, temperament, env));
+        ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, temperament, env, caseSymptoms));
       } else {
-        supabaseAskQuestion(caseId, message, caseCtx, temperament, env).catch(() => {});
+        supabaseAskQuestion(caseId, message, caseCtx, temperament, env, caseSymptoms).catch(() => {});
       }
     }
     // Return contextual fallback — student never waits
@@ -1447,10 +1454,16 @@ async function supabaseFetch(fnPath, options = {}, env, role = 'anon') {
 }
 
 /** Check Supabase reply_bank for a verified answer */
-async function supabaseGetAnswer(caseId, question, env) {
+async function supabaseGetAnswer(caseId, question, env, symptoms = [], discipline = null) {
   try {
+    const params = new URLSearchParams({
+      caseId,
+      question,
+      ...(symptoms.length ? { symptoms: symptoms.join(',') } : {}),
+      ...(discipline ? { discipline } : {}),
+    });
     const resp = await supabaseFetch(
-      `/get-answer?caseId=${encodeURIComponent(caseId)}&question=${encodeURIComponent(question)}`,
+      `/get-answer?${params.toString()}`,
       { method: 'GET' },
       env, 'anon',
     );
@@ -1461,10 +1474,10 @@ async function supabaseGetAnswer(caseId, question, env) {
 }
 
 /** Queue unknown question with Supabase — fire-and-forget */
-async function supabaseAskQuestion(caseId, question, caseContext, personality, env) {
+async function supabaseAskQuestion(caseId, question, caseContext, personality, env, symptoms = []) {
   return supabaseFetch(
     '/ask-question',
-    { method: 'POST', body: JSON.stringify({ caseId, question, caseContext, personality }) },
+    { method: 'POST', body: JSON.stringify({ caseId, question, caseContext, personality, symptoms }) },
     env, 'anon',
   );
 }
