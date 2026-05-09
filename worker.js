@@ -706,9 +706,9 @@ async function handleChat(request, env, ctx) {
         discipline: caseData.discipline,
       };
       if (ctx) {
-        ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, personality, env));
+        ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, temperament, env));
       } else {
-        supabaseAskQuestion(caseId, message, caseCtx, personality, env).catch(() => {});
+        supabaseAskQuestion(caseId, message, caseCtx, temperament, env).catch(() => {});
       }
     }
     // Return contextual fallback immediately — student never waits
