@@ -681,7 +681,9 @@ async function handleChat(request, env, ctx) {
   const caseDiscipline = caseData.discipline ?? null;
 
   // ── Classify single intent ──────────────────────────────────
-  const intent = classifyIntent(normText, INTENT_PATTERNS);
+  // Reject single-word or very short queries — too ambiguous for intent matching
+  const wordCount = normText.trim().split(/\s+/).length;
+  const intent = wordCount >= 2 ? classifyIntent(normText, INTENT_PATTERNS) : null;
   if (!intent) {
     // ── Supabase reply_bank check (Layer 1: Worker KV, Layer 2: Supabase) ──
     if (env.SUPABASE_URL && env.SUPABASE_ANON_KEY) {
@@ -1154,6 +1156,8 @@ const INTENT_PATTERNS = [
   // ── Social & Other History ────────────────────────────────────
   { id:'shx_travel',      keywords:['travel','trip','visit','journey','abroad','visited','returned','forest','rural','endemic','outside','bush'],
     phrases:['any recent travel','have you travelled','any travel history','been anywhere recently','visited any endemic area','been to any rural area','forest area'] },
+  { id:'birth_cry',        keywords:['cry','cried','crying','scream','shout','wail','vigorous'],
+    phrases:['did baby cry','did he cry','did she cry','cry at birth','cry after birth','cry immediately','vigorous cry','birth cry','cried at birth','cried after birth','did the baby cry','was there a cry'] },
   { id:'parity',          keywords:['parity','gravida','para','previous pregnancy','first pregnancy','second pregnancy','how many children','obstetric history','miscarriage','abortion','stillbirth','previous delivery'],
     phrases:['obstetric history','parity','any previous pregnancies','how many children','first pregnancy','any miscarriages','previous deliveries'] },
   { id:'antenatal',       keywords:['antenatal','anc','booking','antenatal care','scan','ultrasound scan','booking visit','gestation','weeks pregnant','trimester'],
