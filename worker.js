@@ -724,10 +724,43 @@ async function handleChat(request, env, ctx) {
 
   const responseData = caseData.intentMap[intent.id];
   if (!responseData) {
-    const notApplicable = generateNotApplicable(intent.id, caseData);
+    // Intent matched but case has no answer for it — route to Supabase for LLM reply
+    if (env.SUPABASE_URL && env.SUPABASE_ANON_KEY) {
+      const kvKey = workerAnswerKey(caseId, message);
+      if (env.CASES_KV) {
+        const kvHit = await env.CASES_KV.get(kvKey);
+        if (kvHit) {
+          return json({ reply: kvHit, intentId: intent.id, type: 'cached', isDangerous: false, score: 0, source: 'worker_kv' });
+        }
+      }
+      const cachedAnswer = await supabaseGetAnswer(caseId, message, env);
+      if (cachedAnswer) {
+        if (env.CASES_KV && ctx) {
+          ctx.waitUntil(env.CASES_KV.put(kvKey, cachedAnswer, { expirationTtl: 86400 * 7 }));
+        }
+        return json({ reply: cachedAnswer, intentId: intent.id, type: 'cached', isDangerous: false, score: 0, source: 'supabase_reply_bank' });
+      }
+      // Queue for LLM generation — fire and forget
+      const caseCtx = {
+        patientName: caseData.patient?.name,
+        age: caseData.patient?.age,
+        sex: caseData.patient?.sex,
+        diagnosis: caseData.diagnosis?.primary,
+        presentingComplaint: caseData.presentingComplaint,
+        hospital: caseData.hospital,
+        discipline: caseData.discipline,
+      };
+      if (ctx) {
+        ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, temperament, env));
+      } else {
+        supabaseAskQuestion(caseId, message, caseCtx, temperament, env).catch(() => {});
+      }
+    }
+    // Return contextual fallback — student never waits
+    const fallback = generateFallback(normText, caseData, conversationHistory);
     return json({
-      reply: notApplicable,
-      intentId: intent.id, type: 'history',
+      reply: fallback,
+      intentId: intent.id, type: 'fallback',
       isDangerous: false, score: 0,
       normalisedText: normText,
       temperamentApplied: temperament,
