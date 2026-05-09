@@ -873,14 +873,20 @@ async function handleKnowledgeQuery(url, env) {
 // ══════════════════════════════════════════════════════════════
 
 function classifyIntent(normText, patterns) {
-  let bestMatch = null;
-  let bestScore = 0;
+  const scored = [];
+
   for (const pattern of patterns) {
     let score = 0;
-    // Exact phrase matching (highest weight)
+    let phraseHit = false;
+
+    // Exact phrase matching (highest weight — unambiguous)
     for (const phrase of (pattern.phrases || [])) {
-      if (normText.includes(phrase.toLowerCase())) score += 30;
+      if (normText.includes(phrase.toLowerCase())) {
+        score += 30;
+        phraseHit = true;
+      }
     }
+
     // Keyword matching
     let keywordHits = 0;
     for (const kw of (pattern.keywords || [])) {
@@ -893,9 +899,32 @@ function classifyIntent(normText, patterns) {
     }
     if (keywordHits >= 2) score += 10;
     if (keywordHits >= 4) score += 10;
-    if (score > bestScore) { bestScore = score; bestMatch = pattern; }
+
+    if (score > 0) scored.push({ pattern, score, phraseHit });
   }
-  return bestScore >= 10 ? bestMatch : null;
+
+  if (scored.length === 0) return null;
+
+  // Sort descending by score
+  scored.sort((a, b) => b.score - a.score);
+  const best   = scored[0];
+  const second = scored[1];
+
+  // Must meet minimum score threshold
+  if (best.score < 10) return null;
+
+  // If best match was phrase-triggered → high confidence, return immediately
+  if (best.phraseHit) return best.pattern;
+
+  // Ambiguity check — if second match is too close, fall through to Supabase
+  // Margin must be at least 15 points for keyword-only matches
+  if (second && (best.score - second.score) < 15) {
+    // Both intents matched similarly — question is ambiguous
+    // Return null so Supabase handles it with full context
+    return null;
+  }
+
+  return best.pattern;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1055,7 +1084,7 @@ const INTENT_PATTERNS = [
     phrases:['can you lie flat','how many pillows','breathless when lying','orthopnoea','do you sleep propped up','breathlessness on lying down'] },
 
   // ── Systems Review ────────────────────────────────────────────
-  { id:'sr_fever',        keywords:['fever','temperature','hot','pyrexia','febrile','chills','rigors','shivering','sweating','sweats','night sweats','hypothermia','body hot'],
+  { id:'sr_fever',        keywords:['fever','temperature','hot','pyrexia','febrile','chills','rigors','shivering','hypothermia','body hot','night sweats'],
     phrases:['any fever','any temperature','do you have fever','feeling hot','any chills','any rigors','any night sweats','any shivering','is there fever'] },
   { id:'sr_nausea',       keywords:['nausea','vomit','sick','vomiting','retching','throw up','nauseated','vomited','emesis','morning sickness'],
     phrases:['any nausea','any vomiting','have you vomited','feeling sick','any sickness','do you feel sick','any retching','have you been sick'] },
@@ -1069,6 +1098,8 @@ const INTENT_PATTERNS = [
     phrases:['any swelling','ankle swelling','leg swelling','facial swelling','any oedema','are the ankles swollen','any fluid retention'] },
   { id:'sr_chest_pain',   keywords:['chest pain','chest tightness','chest pressure','angina','cardiac','retrosternal','precordial','chest discomfort','chest heaviness','substernal'],
     phrases:['any chest pain','any chest tightness','pain in your chest','chest discomfort','any pressure in the chest','retrosternal pain'] },
+  { id:'sr_sweating',     keywords:['sweat','sweating','sweats','perspire','perspiring','perspiration','diaphoresis','damp','soaking','drench','wet','clammy'],
+    phrases:['any sweating','does he sweat','does she sweat','sweating during feeding','sweating while feeding','sweating while breastfeeding','any night sweats','profuse sweating','sweats a lot','sweating on forehead'] },
   { id:'sr_appetite',     keywords:['appetite','eat','food','hungry','meal','diet','anorexia','loss of appetite','reduced appetite'],
     phrases:['how is your appetite','are you eating','any change in appetite','loss of appetite'] },
   { id:'sr_bowels',       keywords:['bowels','stool','poo','diarrhoea','diarrhea','constipation','blood stool','melaena','change bowel','loose stool'],
