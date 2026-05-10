@@ -680,6 +680,43 @@ async function handleChat(request, env, ctx) {
     : [];
   const caseDiscipline = caseData.discipline ?? null;
 
+  // ── Check conversational consistency first ──────────────────
+  // Prevent patient from contradicting previously stated facts
+  const consistentReply = checkConsistency(normText, conversationHistory);
+  if (consistentReply) {
+    return json({
+      reply: consistentReply,
+      intentId: 'consistency_check',
+      type: 'consistent_reply',
+      isDangerous: false, score: 0,
+      normalisedText: normText,
+      temperamentApplied: temperament,
+    });
+  }
+
+  // ── Check hidden facts first ────────────────────────────────
+  // Some information only reveals itself after proper history taking
+  const hiddenFactResult = resolveHiddenFact(normText, caseData, askedIntents);
+  if (hiddenFactResult) {
+    // Log unlock event if newly unlocked
+    if (hiddenFactResult.unlocked) {
+      console.log(`[hidden_facts] Unlocked: ${hiddenFactResult.factKey}`);
+    } else {
+      console.log(`[hidden_facts] Locked: ${hiddenFactResult.factKey} — conditions not met`);
+    }
+    return json({
+      reply: hiddenFactResult.response,
+      intentId: `hidden_fact_${hiddenFactResult.factKey}`,
+      type: hiddenFactResult.unlocked ? 'hidden_fact_unlocked' : 'hidden_fact_locked',
+      isDangerous: false,
+      score: 0,
+      normalisedText: normText,
+      temperamentApplied: temperament,
+      hiddenFact: hiddenFactResult.factKey,
+      unlocked: hiddenFactResult.unlocked,
+    });
+  }
+
   // ── Classify single intent ──────────────────────────────────
   // Reject single-word or very short queries — too ambiguous for intent matching
   const wordCount = normText.trim().split(/\s+/).length;
@@ -1026,6 +1063,87 @@ function checkDanger(normText, caseData) {
 // ══════════════════════════════════════════════════════════════
 //  CONTEXTUAL FALLBACK GENERATOR
 // ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════
+//  CONVERSATIONAL CONSISTENCY ENGINE
+//  Extracts key facts from responses and maintains them
+//  across the conversation to prevent contradictions
+// ══════════════════════════════════════════════════════════════
+
+// Keywords that signal duration/timeline questions
+const TIMELINE_KEYWORDS = [
+  'how long', 'since when', 'when did', 'how many days', 'how many weeks',
+  'how many months', 'started', 'began', 'duration', 'for how long',
+];
+
+const FOLLOWUP_KEYWORDS = [
+  'how long', 'since when', 'how long ago', 'you said', 'earlier you',
+  'as you said', 'how long has it been', 'how long have you had',
+];
+
+function checkConsistency(normText, conversationHistory) {
+  // Only check follow-up questions
+  if (!FOLLOWUP_KEYWORDS.some(kw => normText.includes(kw))) return null;
+  if (!conversationHistory || conversationHistory.length < 2) return null;
+
+  // Look for previously revealed durations/timelines in history
+  const durationPattern = /(\d+)\s*(day|days|week|weeks|month|months|year|years)/gi;
+
+  for (const turn of conversationHistory.slice().reverse()) {
+    if (turn.role !== 'assistant') continue;
+    const matches = turn.content?.match(durationPattern);
+    if (matches && matches.length > 0) {
+      // Return consistency reminder with the previously stated duration
+      return `As I said doctor, ${matches[0]} now.`;
+    }
+  }
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  HIDDEN FACTS + UNLOCK CONDITIONS ENGINE
+//  Checks if a question touches a hidden fact and whether
+//  the student has unlocked it through proper history taking
+// ══════════════════════════════════════════════════════════════
+
+function resolveHiddenFact(normText, caseData, askedIntents) {
+  const hiddenFacts = caseData.hidden_facts;
+  if (!hiddenFacts) return null;
+
+  // Map question keywords to hidden fact keys
+  const HIDDEN_FACT_TRIGGERS = {
+    'maternal_blood_group':    ['blood group', 'blood type', 'rhesus', 'abo'],
+    'g6pd_status':             ['g6pd', 'enzyme', 'haemolysis', 'deficiency'],
+    'family_seizure_history':  ['family', 'anyone else', 'relative', 'sibling', 'parent', 'father', 'mother'],
+    'developmental_history':   ['development', 'milestone', 'walking', 'talking', 'sitting'],
+    'tb_contact':              ['contact', 'neighbour', 'cough', 'tuberculosis', 'tb', 'anyone coughing'],
+    'hiv_status':              ['hiv', 'aids', 'retroviral', 'positive', 'status'],
+    'feeding_history':         ['breastfeed', 'breast feed', 'formula', 'weaning', 'feeding'],
+    'socioeconomic_status':    ['work', 'job', 'income', 'afford', 'money', 'occupation'],
+    'steroid_response':        ['previous episode', 'before', 'happened before', 'recurrence', 'again'],
+    'family_renal_history':    ['family', 'kidney', 'relative', 'dialysis', 'renal'],
+  };
+
+  for (const [factKey, triggers] of Object.entries(HIDDEN_FACT_TRIGGERS)) {
+    if (!hiddenFacts[factKey]) continue;
+    if (!triggers.some(t => normText.includes(t))) continue;
+
+    const fact = hiddenFacts[factKey];
+    const unlockConditions = fact.unlock_conditions || [];
+
+    // Check if student has asked enough to unlock this fact
+    const unlocked = unlockConditions.length === 0 ||
+        unlockConditions.some(condition => askedIntents.includes(condition));
+
+    return {
+      factKey,
+      unlocked,
+      response: unlocked ? fact.unlocked_response : fact.locked_response,
+    };
+  }
+
+  return null;
+}
 
 // ══════════════════════════════════════════════════════════════
 //  SYMPTOM-AWARE NEGATIVE REPLY GENERATOR
