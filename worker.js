@@ -704,7 +704,7 @@ async function handleChat(request, env, ctx) {
         }
         return json({ reply: cachedAnswer, intentId: null, type: 'cached', isDangerous: false, score: 0, source: 'supabase_reply_bank' });
       }
-      // No cached answer — queue silently (fire-and-forget, don't block student)
+      // No cached answer — check if symptom is relevant to case before queuing
       const caseCtx = {
         patientName: caseData.patient?.name,
         age: caseData.patient?.age,
@@ -714,6 +714,26 @@ async function handleChat(request, env, ctx) {
         hospital: caseData.hospital,
         discipline: caseData.discipline,
       };
+
+      // Symptom NOT in case → return negative reply immediately, skip LLM queue
+      if (!symptomInCase(normText, caseSymptoms)) {
+        const negativeReply = generateNegativeReply(normText, caseData);
+        // Still queue silently — LLM will generate a more nuanced version for next time
+        if (ctx) {
+          ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, temperament, env, caseSymptoms));
+        } else {
+          supabaseAskQuestion(caseId, message, caseCtx, temperament, env, caseSymptoms).catch(() => {});
+        }
+        return json({
+          reply: negativeReply,
+          intentId: null, type: 'negative_finding',
+          isDangerous: false, score: 0,
+          normalisedText: normText,
+          temperamentApplied: temperament,
+        });
+      }
+
+      // Symptom IS in case → queue for specific LLM answer
       if (ctx) {
         ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, temperament, env, caseSymptoms));
       } else {
@@ -759,6 +779,24 @@ async function handleChat(request, env, ctx) {
         hospital: caseData.hospital,
         discipline: caseData.discipline,
       };
+
+      // Symptom NOT in case → return negative reply immediately
+      if (!symptomInCase(normText, caseSymptoms)) {
+        const negativeReply = generateNegativeReply(normText, caseData);
+        if (ctx) {
+          ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, temperament, env, caseSymptoms));
+        } else {
+          supabaseAskQuestion(caseId, message, caseCtx, temperament, env, caseSymptoms).catch(() => {});
+        }
+        return json({
+          reply: negativeReply,
+          intentId: intent.id, type: 'negative_finding',
+          isDangerous: false, score: 0,
+          normalisedText: normText,
+          temperamentApplied: temperament,
+        });
+      }
+
       if (ctx) {
         ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, temperament, env, caseSymptoms));
       } else {
@@ -989,6 +1027,81 @@ function checkDanger(normText, caseData) {
 // ══════════════════════════════════════════════════════════════
 //  CONTEXTUAL FALLBACK GENERATOR
 // ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════
+//  SYMPTOM-AWARE NEGATIVE REPLY GENERATOR
+//  Called when a question is NOT in case_symptoms[]
+//  Returns a clinically appropriate negative/absent finding
+// ══════════════════════════════════════════════════════════════
+
+// Maps question keywords to negative reply templates
+const NEGATIVE_REPLY_MAP = [
+  { keywords: ['fever','temperature','hot','pyrexia','febrile'],
+    reply: (p) => `${p}No doctor, no fever. I have not been feeling hot.` },
+  { keywords: ['cough','coughing'],
+    reply: (p) => `${p}No doctor, no cough at all.` },
+  { keywords: ['wheeze','wheezing','whistling'],
+    reply: (p) => `${p}No doctor, no whistling sound from the chest.` },
+  { keywords: ['vomit','vomiting','nausea','throw up'],
+    reply: (p) => `${p}No doctor, no vomiting.` },
+  { keywords: ['diarrhoea','diarrhea','loose stool','watery stool'],
+    reply: (p) => `${p}No doctor, no diarrhoea. Stool has been normal.` },
+  { keywords: ['convuls','seizure','fit','shaking','jerking'],
+    reply: (p) => `${p}No doctor, no convulsion or fit.` },
+  { keywords: ['rash','skin','itching','itch'],
+    reply: (p) => `${p}No doctor, no rash or skin problem.` },
+  { keywords: ['bleed','bleeding','blood'],
+    reply: (p) => `${p}No doctor, no bleeding anywhere.` },
+  { keywords: ['headache','head pain','head ache'],
+    reply: (p) => `${p}No doctor, no headache.` },
+  { keywords: ['chest pain','chest discomfort'],
+    reply: (p) => `${p}No doctor, no chest pain.` },
+  { keywords: ['palpitation','heart beat','heart racing','fast heart'],
+    reply: (p) => `${p}No doctor, I have not noticed my heart beating fast.` },
+  { keywords: ['sweat','sweating','perspir'],
+    reply: (p) => `${p}No doctor, no excessive sweating.` },
+  { keywords: ['weight loss','losing weight','weight drop'],
+    reply: (p) => `${p}No doctor, weight has been stable as far as I know.` },
+  { keywords: ['appetite','eating','food','hungry'],
+    reply: (p) => `${p}My appetite has been okay, eating normally.` },
+  { keywords: ['urine','urinating','urination','pee','passing urine'],
+    reply: (p) => `${p}No doctor, urine has been normal — no pain or burning.` },
+  { keywords: ['stool','bowel','constipat'],
+    reply: (p) => `${p}No doctor, bowels have been moving normally.` },
+  { keywords: ['drool','drooling'],
+    reply: (p) => `${p}No doctor, no drooling.` },
+  { keywords: ['walk','walking','movement','mobility'],
+    reply: (p) => `${p}Yes doctor, walking normally with no problem.` },
+  { keywords: ['neck stiff','neck pain','stiff neck'],
+    reply: (p) => `${p}No doctor, no neck stiffness or pain.` },
+  { keywords: ['ear','hearing','earache'],
+    reply: (p) => `${p}No doctor, no ear pain or hearing problem.` },
+  { keywords: ['eye','vision','seeing','sight'],
+    reply: (p) => `${p}No doctor, eyes are fine, seeing clearly.` },
+];
+
+function generateNegativeReply(normText, caseData) {
+  const age = caseData.patient?.age ?? '?';
+  const sex = (caseData.patient?.sex || '').toLowerCase();
+  const isProxy = typeof age === 'number' && age < 5;
+  const proxyPrefix = isProxy ? '(Mother) ' : '';
+
+  // Match question against negative reply map
+  for (const entry of NEGATIVE_REPLY_MAP) {
+    if (entry.keywords.some(kw => normText.includes(kw))) {
+      return entry.reply(proxyPrefix);
+    }
+  }
+
+  // Generic negative fallback
+  return `${proxyPrefix}No doctor, nothing like that.`;
+}
+
+// Check if a symptom keyword is present in the case symptoms array
+function symptomInCase(normText, caseSymptoms) {
+  if (!caseSymptoms || caseSymptoms.length === 0) return false;
+  return caseSymptoms.some(symptom => normText.includes(symptom.toLowerCase()));
+}
 
 function generateFallback(normText, caseData, history) {
   const age = caseData.patient?.age;
