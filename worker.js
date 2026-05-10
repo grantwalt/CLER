@@ -990,17 +990,16 @@ function classifyIntent(normText, patterns) {
   const best   = scored[0];
   const second = scored[1];
 
-  // Must meet minimum score threshold
-  if (best.score < 10) return null;
+  // Must meet minimum score threshold — raised to 20 for near-perfect matching
+  if (best.score < 20) return null;
 
   // If best match was phrase-triggered → high confidence, return immediately
   if (best.phraseHit) return best.pattern;
 
-  // Ambiguity check — if second match is too close, fall through to Supabase
-  // Margin must be at least 15 points for keyword-only matches
-  if (second && (best.score - second.score) < 15) {
-    // Both intents matched similarly — question is ambiguous
-    // Return null so Supabase handles it with full context
+  // Ambiguity check — raised margin to 25 for keyword-only matches
+  // Only fire intent when clearly dominant over second-best
+  if (second && (best.score - second.score) < 25) {
+    // Too close — question is ambiguous, let Supabase handle with full context
     return null;
   }
 
