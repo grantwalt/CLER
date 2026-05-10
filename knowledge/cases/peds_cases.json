@@ -147,6 +147,24 @@
         ],
         "pointsBase": 5,
         "pointsMust": 15
+      },
+      "hidden_facts": {
+        "maternal_blood_group": {
+          "unlock_conditions": [
+            "birth_history",
+            "maternal_history"
+          ],
+          "locked_response": "(Mother) I am not sure doctor, they checked my blood during antenatal.",
+          "unlocked_response": "(Mother) I am blood group O positive doctor. They checked during antenatal care."
+        },
+        "g6pd_status": {
+          "unlock_conditions": [
+            "family_history",
+            "pmh"
+          ],
+          "locked_response": "(Mother) I don't know about that doctor.",
+          "unlocked_response": "(Mother) Yes doctor, my husband has the sickle cell trait \u2014 could that be related?"
+        }
       }
     },
     {
@@ -303,6 +321,23 @@
         ],
         "pointsBase": 5,
         "pointsMust": 15
+      },
+      "hidden_facts": {
+        "feeding_history": {
+          "unlock_conditions": [
+            "birth_history",
+            "social_history"
+          ],
+          "locked_response": "(Mother) I tried to feed him well doctor.",
+          "unlocked_response": "(Mother) I stopped breastfeeding at 3 months when I went back to work. He has been on pap and formula since then."
+        },
+        "socioeconomic_status": {
+          "unlock_conditions": [
+            "social_history"
+          ],
+          "locked_response": "(Mother) We manage doctor.",
+          "unlocked_response": "(Mother) My husband lost his job six months ago. Sometimes we eat once a day."
+        }
       }
     },
     {
@@ -747,6 +782,23 @@
         ],
         "pointsBase": 5,
         "pointsMust": 15
+      },
+      "hidden_facts": {
+        "family_seizure_history": {
+          "unlock_conditions": [
+            "family_history"
+          ],
+          "locked_response": "(Mother) Nobody has ever had that in our family.",
+          "unlocked_response": "(Mother) Actually doctor, my husband had something like that as a child too."
+        },
+        "developmental_history": {
+          "unlock_conditions": [
+            "birth_history",
+            "social_history"
+          ],
+          "locked_response": "(Mother) She has been growing normally.",
+          "unlocked_response": "(Mother) She started walking at 13 months and says a few words. The clinic said she is developing well."
+        }
       }
     },
     {
@@ -882,6 +934,25 @@
         ],
         "pointsBase": 5,
         "pointsMust": 15
+      },
+      "hidden_facts": {
+        "tb_contact": {
+          "unlock_conditions": [
+            "social_history",
+            "family_history"
+          ],
+          "locked_response": "I don't know about any sick person around us.",
+          "unlocked_response": "(Mother) Now that you mention it, our neighbour was coughing a lot and lost weight \u2014 he died last month."
+        },
+        "hiv_status": {
+          "unlock_conditions": [
+            "pmh",
+            "medication_history",
+            "social_history"
+          ],
+          "locked_response": "(Mother) I don't understand what you mean doctor.",
+          "unlocked_response": "(Mother) Yes doctor, I am positive. I have been on treatment since his birth. He was tested too."
+        }
       }
     },
     {
@@ -1813,6 +1884,23 @@
         ],
         "pointsBase": 5,
         "pointsMust": 15
+      },
+      "hidden_facts": {
+        "steroid_response": {
+          "unlock_conditions": [
+            "pmh",
+            "medication_history"
+          ],
+          "locked_response": "(Mother) This is the first time we are noticing this doctor.",
+          "unlocked_response": "(Mother) Actually doctor, this happened once before when she was four. They gave her some tablets and she got better quickly."
+        },
+        "family_renal_history": {
+          "unlock_conditions": [
+            "family_history"
+          ],
+          "locked_response": "Nobody in our family has kidney problem that I know of.",
+          "unlocked_response": "(Mother) My brother has been on dialysis for two years now. Could that be connected?"
+        }
       }
     },
     {
