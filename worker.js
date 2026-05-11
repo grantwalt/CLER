@@ -717,10 +717,28 @@ async function handleChat(request, env, ctx) {
     });
   }
 
+  // ── Load dynamic intent patterns ────────────────────────────
+  // Merges static base patterns with case/discipline-specific patterns
+  // fetched from Supabase (cached in KV for 24hrs)
+  let activePatterns = INTENT_PATTERNS;
+  try {
+    const dynamicPatterns = await loadDynamicIntentPatterns(env);
+    if (dynamicPatterns.length > 0) {
+      activePatterns = mergeIntentPatterns(
+        INTENT_PATTERNS,
+        dynamicPatterns,
+        caseId,
+        caseData.discipline ?? 'global'
+      );
+    }
+  } catch (_) {
+    // Fall back to static patterns silently
+  }
+
   // ── Classify single intent ──────────────────────────────────
   // Reject single-word or very short queries — too ambiguous for intent matching
   const wordCount = normText.trim().split(/\s+/).length;
-  const intent = wordCount >= 2 ? classifyIntent(normText, INTENT_PATTERNS) : null;
+  const intent = wordCount >= 2 ? classifyIntent(normText, activePatterns) : null;
   if (!intent) {
     // ── Supabase reply_bank check (Layer 1: Worker KV, Layer 2: Supabase) ──
     if (env.SUPABASE_URL && env.SUPABASE_ANON_KEY) {
@@ -1273,6 +1291,86 @@ function generateNotApplicable(intentId, caseData) {
     immunisation:     `Up to date with vaccinations as far as I know.`,
   };
   return naResponses[intentId] || `No, that's not something I've noticed or experienced.`;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  DYNAMIC INTENT PATTERN LOADER
+//  Fetches intent patterns from Supabase at runtime
+//  Cached in KV for 24 hours — no Worker deployment needed
+//  for new cases
+// ══════════════════════════════════════════════════════════════
+
+const INTENT_CACHE_KEY = 'dynamic:intent_patterns';
+const INTENT_CACHE_TTL = 86400; // 24 hours
+
+async function loadDynamicIntentPatterns(env) {
+  // Check KV cache first
+  if (env.CASES_KV) {
+    try {
+      const cached = await env.CASES_KV.get(INTENT_CACHE_KEY);
+      if (cached) return JSON.parse(cached);
+    } catch (_) {}
+  }
+
+  // Fetch from Supabase
+  try {
+    const url = `${env.SUPABASE_URL}/rest/v1/intent_patterns?active=eq.true&select=intent_id,discipline,case_id,keywords,phrases`;
+    const resp = await fetch(url, {
+      headers: {
+        'apikey': env.SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${env.SUPABASE_ANON_KEY}`,
+      },
+    });
+
+    if (!resp.ok) return [];
+    const patterns = await resp.json();
+
+    // Cache in KV
+    if (env.CASES_KV && patterns.length) {
+      await env.CASES_KV.put(
+        INTENT_CACHE_KEY,
+        JSON.stringify(patterns),
+        { expirationTtl: INTENT_CACHE_TTL }
+      );
+    }
+
+    return patterns;
+  } catch (_) {
+    return [];
+  }
+}
+
+function mergeIntentPatterns(staticPatterns, dynamicPatterns, caseId, discipline) {
+  // Start with static base patterns
+  const merged = [...staticPatterns];
+  const existingIds = new Set(staticPatterns.map(p => p.id));
+
+  for (const dp of dynamicPatterns) {
+    // Only include patterns relevant to this case or discipline
+    const isRelevant =
+      dp.case_id === caseId ||
+      dp.case_id === null ||
+      dp.discipline === discipline ||
+      dp.discipline === 'global';
+
+    if (!isRelevant) continue;
+
+    const existing = merged.find(p => p.id === dp.intent_id);
+    if (existing) {
+      // Merge keywords and phrases into existing pattern
+      existing.keywords = [...new Set([...(existing.keywords || []), ...dp.keywords])];
+      existing.phrases  = [...new Set([...(existing.phrases  || []), ...dp.phrases])];
+    } else {
+      // Add new dynamic pattern
+      merged.push({
+        id:       dp.intent_id,
+        keywords: dp.keywords || [],
+        phrases:  dp.phrases  || [],
+      });
+    }
+  }
+
+  return merged;
 }
 
 // ══════════════════════════════════════════════════════════════
