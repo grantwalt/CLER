@@ -1496,7 +1496,6 @@ const INTENT_PATTERNS = [
     phrases:['any oral thrush','white patches in mouth','mouth infection'] },
   { id:'sr_night_sweats',    keywords:['night sweat','sweating at night','sweats at night','nocturnal sweating'],
     phrases:['any night sweats','sweating at night','sweats during sleep'] },
-    phrases:['any sweating','does he sweat','does she sweat','sweating during feeding','sweating while feeding','sweating while breastfeeding','any night sweats','profuse sweating','sweats a lot','sweating on forehead'] },
   { id:'sr_appetite',     keywords:['appetite','eat','food','hungry','meal','diet','anorexia','loss of appetite','reduced appetite'],
     phrases:['how is your appetite','are you eating','any change in appetite','loss of appetite'] },
   { id:'sr_bowels',       keywords:['bowels','stool','poo','diarrhoea','diarrhea','constipation','blood stool','melaena','change bowel','loose stool'],
