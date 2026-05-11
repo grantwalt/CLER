@@ -1469,6 +1469,7 @@ const INTENT_PATTERNS = [
   { id:'sr_chest_pain',   keywords:['chest pain','chest tightness','chest pressure','angina','cardiac','retrosternal','precordial','chest discomfort','chest heaviness','substernal'],
     phrases:['any chest pain','any chest tightness','pain in your chest','chest discomfort','any pressure in the chest','retrosternal pain'] },
   { id:'sr_sweating',     keywords:['sweat','sweating','sweats','perspire','perspiring','perspiration','diaphoresis','damp','soaking','drench','wet','clammy'],
+    phrases:['any sweating','does he sweat','does she sweat','sweating during feeding','sweating while breastfeeding','any night sweats','profuse sweating'] },
 
   // ── Pneumonia / Respiratory intent clusters ───────────────────
   { id:'sr_fast_breathing',  keywords:['fast breathing','rapid breathing','breathing fast','tachypnoea','respiratory rate','breathing quickly','breathing too fast'],
