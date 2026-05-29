@@ -1,5 +1,5 @@
 /**
- * ClerkAI — Cloudflare Worker Suite  v2.0
+ * ClerkAI — Cloudflare Worker Suite  v2.1
  * ══════════════════════════════════════════════════════════════
  * Offline Clinical Reasoning Simulator
  * Zero-LLM, fully rule-based medical intelligence engine.
@@ -17,6 +17,11 @@
  *     Each patient has a temperament + emotional state that
  *     colours their replies with authentic distress, reticence,
  *     or openness — without needing an LLM.
+ *
+ * ✦ UPGRADE 5 — Reply Scope Control
+ *     patient_text / examiner_text split. Closed questions get
+ *     1 sentence; open questions get max 2. examiner_text is
+ *     returned silently in JSON for the mark-sheet phase only.
  *
  * ✦ UPGRADE 4 — Knowledge Expansion
  *     Every scored intent now triggers a teaching-pearl lookup
@@ -330,6 +335,44 @@ function applyPersonality(baseText, temperament, isDistressed, rng) {
   return `${open}${base}${close}`.trim();
 }
 
+
+// ══════════════════════════════════════════════════════════════
+//  REPLY SCOPE CONTROL
+//  Caps patient replies to avoid giving away too much per turn.
+//  Closed questions (yes/no pattern) → 1 sentence.
+//  Open/specific questions           → max 2 sentences.
+//  The full patient_text is preserved in the case data and
+//  returned fully only during feedback/mark-sheet phase.
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * isClosedQuestion(normText)
+ * Returns true if the student asked a binary yes/no question.
+ */
+function isClosedQuestion(normText) {
+  return /^(do|did|does|is|are|has|have|was|were|any|can|could|will|would)\b/i.test(normText.trim());
+}
+
+/**
+ * capPatientReply(text, normText)
+ * Limits reply scope to prevent over-disclosure during clerking.
+ * - Closed question  → first sentence only
+ * - Open question    → first two sentences max
+ * Preserves trailing punctuation and avoids cutting mid-phrase.
+ */
+function capPatientReply(text, normText) {
+  if (!text) return text;
+  // Split on sentence boundaries (period, exclamation, question mark)
+  // but preserve parenthetical openings like "(Mother) ..."
+  const sentences = text.match(/[^.!?]+[.!?]+(?:\s|$)/g);
+  if (!sentences || sentences.length <= 1) return text.trim();
+  if (isClosedQuestion(normText)) {
+    return sentences[0].trim();
+  }
+  // Open or specific question → max 2 sentences
+  return sentences.slice(0, 2).join('').trim();
+}
+
 /** isDistressedIntent — intents that represent distressing symptoms */
 const DISTRESS_INTENTS = new Set([
   'sr_seizures','sr_consciousness','sr_chest_pain','sr_fetal_movement',
@@ -549,9 +592,9 @@ async function handleHealth(env) {
 
   return json({
     status: 'online',
-    engine: 'ClerkAI Medical Engine v2.0 — Offline Clinical Reasoning Simulator',
+    engine: 'ClerkAI Medical Engine v2.1 — Offline Clinical Reasoning Simulator',
     mode: 'rule-based',
-    upgrades: ['text-normalisation', 'intent-clustering', 'personality-system', 'knowledge-expansion'],
+    upgrades: ['text-normalisation', 'intent-clustering', 'personality-system', 'knowledge-expansion', 'reply-scope-control'],
     timestamp: Date.now(),
     kvBindings: {
       cases: !!env.CASES_KV,
@@ -649,7 +692,10 @@ async function handleChat(request, env, ctx) {
                 : isShould ? (caseData.scoringMap.pointsBase || 10) : 5;
       totalPts += pts;
       scored.push({ intentId: id, score: pts, label: entry.label });
-      replies.push(`[${entry.label}] ${entry.text}`);
+      // Use patient_text; cap to 2 sentences for cluster replies
+      const clusterRaw = entry.patient_text || entry.text || '';
+      const clusterCapped = capPatientReply(clusterRaw, normText);
+      replies.push(`[${entry.label}] ${clusterCapped}`);
     }
     // Attach a pearl for the most important intent in the cluster
     const primaryId = scored.find(s => s.score >= 15)?.intentId
@@ -882,9 +928,16 @@ async function handleChat(request, env, ctx) {
   const isDistressed = DISTRESS_INTENTS.has(intent.id);
   // Simple deterministic RNG seeded by message length + intent id length
   const rng = ((message.length * 7 + intent.id.length * 13) % 100) / 100;
+
+  // Use patient_text during clerking; fall back to legacy .text field
+  const rawPatientText = responseData.patient_text || responseData.text || '';
+
+  // Cap reply scope — prevent over-disclosure per question
+  const cappedText = capPatientReply(rawPatientText, normText);
+
   const wrappedReply = alreadyAsked
-    ? responseData.text   // No personality wrapping on repeat questions
-    : applyPersonality(responseData.text, temperament, isDistressed, rng);
+    ? cappedText   // No personality wrapping on repeat questions
+    : applyPersonality(cappedText, temperament, isDistressed, rng);
 
   // ── UPGRADE 4: Fetch knowledge pearl (only for scored intents)
   const pearl = (!alreadyAsked && (isMust || isShould))
@@ -893,6 +946,7 @@ async function handleChat(request, env, ctx) {
 
   return json({
     reply: wrappedReply,
+    examiner_text: responseData.examiner_text || null,
     intentId: intent.id,
     type: responseData.type || 'history',
     isDangerous: false,
