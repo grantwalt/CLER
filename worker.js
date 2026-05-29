@@ -1,5 +1,5 @@
 /**
- * ClerkAI — Cloudflare Worker Suite  v2.1
+ * ClerkAI — Cloudflare Worker Suite  v2.2
  * ══════════════════════════════════════════════════════════════
  * Offline Clinical Reasoning Simulator
  * Zero-LLM, fully rule-based medical intelligence engine.
@@ -197,7 +197,7 @@ const INTENT_CLUSTERS = {
   full_history:      ['hpc_onset','hpc_character','hpc_radiation','hpc_relieving','hpc_triggers','hpc_associated'],
   social_cluster:    ['shx_general','shx_travel','fhx_general'],
   obstetric_cluster: ['parity','antenatal','sr_fetal_movement','sr_abdominal'],
-  paediatric_hx:     ['immunisation','pmh_general','shx_travel','sr_fever','sr_seizures'],
+  paediatric_hx:     ['immunisation','pmh_general','shx_travel','sr_fever','sr_seizures','birth_history','maternal_history','feeding_history'],
   respiratory_hx:    ['hpc_character','hpc_triggers','sr_fever','pmh_general','meds_general','fhx_general'],
 
   // Examination clusters
@@ -230,6 +230,10 @@ const CLUSTER_TRIGGERS = [
   { phrases: ['malaria workup','malaria investigations','test for malaria'],                      clusters: ['malaria_ix'] },
   { phrases: ['cardiac workup','heart investigations'],                                           clusters: ['cardiac_ix'] },
   { phrases: ['respiratory investigations','breathing tests','lung investigations'],              clusters: ['respiratory_ix'] },
+  { phrases: ['birth history','delivery history','how was baby born','any birth complications',
+               'neonatal history','perinatal history'],                                          clusters: ['paediatric_hx'] },
+  { phrases: ['maternal history','antenatal history','pregnancy history',
+               'obstetric history','any antenatal problems'],                                    clusters: ['obstetric_cluster','paediatric_hx'] },
 ];
 
 /**
@@ -592,7 +596,7 @@ async function handleHealth(env) {
 
   return json({
     status: 'online',
-    engine: 'ClerkAI Medical Engine v2.1 — Offline Clinical Reasoning Simulator',
+    engine: 'ClerkAI Medical Engine v2.2 — Offline Clinical Reasoning Simulator',
     mode: 'rule-based',
     upgrades: ['text-normalisation', 'intent-clustering', 'personality-system', 'knowledge-expansion', 'reply-scope-control'],
     timestamp: Date.now(),
@@ -1099,6 +1103,30 @@ function classifyIntent(normText, patterns) {
   const best   = scored[0];
   const second = scored[1];
 
+  // Boost exact short clinical terms that are unambiguous
+  // Prevents single-word clinical questions from falling below the threshold
+  const SINGLE_WORD_BOOSTS = new Set([
+    'delivery','labour','labor','seizure','jaundice','pallor','fever',
+    'vomiting','rash','cough','wheeze','immunisation','immunization',
+    'vaccination','breastfeeding','feeding','birth','gestation','pregnancy',
+    'convulsion','fit','swelling','oedema','edema','diarrhoea','diarrhea',
+    'constipation','appetite','weight','bleeding','discharge','pain',
+    'headache','breathless','dyspnoea','palpitation','syncope','collapse',
+    'allergy','allergies','medication','medications','surgery','admission',
+    'malaria','tuberculosis','hiv','diabetes','hypertension','asthma',
+    'epilepsy','sickle','anaemia','anemia','jaundice','dehydration',
+    'immunisation','vaccination','travel','occupation','smoking','alcohol',
+  ]);
+  const inputWords = normText.trim().split(/\s+/);
+  if (inputWords.length <= 3 && best) {
+    for (const w of inputWords) {
+      if (SINGLE_WORD_BOOSTS.has(w.toLowerCase())) {
+        best.score += 15;
+        break;
+      }
+    }
+  }
+
   // Must meet minimum score threshold — raised to 20 for near-perfect matching
   if (best.score < 20) return null;
 
@@ -1297,21 +1325,21 @@ function generateFallback(normText, caseData, history) {
   const complaint = caseData.presentingComplaint;
 
   if (/treat|manag|give|prescrib|administer|start.*on/i.test(normText)) {
-    return `As your clinical tutor: management questions aren't part of the clerking phase. Focus on history, examination, and investigations to reach your diagnosis first.`;
+    return `That is not something I can help with, doctor.`;
   }
   if (/diagnos|what is|condition|impression|assessment/i.test(normText)) {
-    return `Use the "Give Diagnosis" button when you're ready to submit your clinical impression. Continue clerking — you may be missing important history.`;
+    return `I'm not sure I understand that, doctor.`;
   }
   if (/thank|okay|ok|noted|i see/i.test(normText)) {
-    return `Please continue with your assessment. Ask me about my symptoms, history, medications, or request an examination.`;
+    return `Please go ahead, doctor.`;
   }
 
   const responses = [
-    `I'm not sure I understand that question. Could you rephrase it? I'm here about my ${complaint?.toLowerCase() || 'symptoms'}.`,
-    `Sorry, I didn't quite follow that. I'm a ${age}-year-old patient — please ask about my symptoms, history, or how I've been feeling.`,
-    `I'm not sure what you mean. You can ask about when it started, what it feels like, my past history, medications, or family history.`,
-    `Could you clarify that? I'm happy to tell you more about my ${complaint?.toLowerCase() || 'problem'}.`,
-    `I don't understand that question. Perhaps ask about my symptoms, examination findings, or investigations instead.`,
+    `I'm not sure I understand that, doctor.`,
+    `Sorry doctor, I didn't quite follow that question.`,
+    `Could you rephrase that, doctor?`,
+    `I'm not sure what you mean, doctor.`,
+    `I didn't understand that question, doctor.`,
   ];
   return responses[history.length % responses.length];
 }
@@ -1564,6 +1592,29 @@ const INTENT_PATTERNS = [
   // ── Social & Other History ────────────────────────────────────
   { id:'shx_travel',      keywords:['travel','trip','visit','journey','abroad','visited','returned','forest','rural','endemic','outside','bush'],
     phrases:['any recent travel','have you travelled','any travel history','been anywhere recently','visited any endemic area','been to any rural area','forest area'] },
+
+  // ── Birth & Maternal History ──────────────────────────────────
+  { id:'birth_history',
+    keywords:['delivery','labour','labor','prolonged','born','birth','gestation',
+              'term','preterm','premature','cord','apgar','neonatal','caesarean',
+              'cs','svd','normal delivery','instrumental','vacuum','forceps',
+              'resuscitation','birth weight','birthweight','newborn','at birth'],
+    phrases:['any prolonged delivery','how was the delivery','mode of delivery',
+             'was there prolonged labour','how was baby born','any birth complications',
+             'type of delivery','was the delivery normal','any problems at birth',
+             'was baby born at term','was it a normal delivery','how was he born',
+             'how was she born','birth history','delivery history','place of delivery',
+             'born at home','born in hospital','any issues at birth',
+             'what was the birth like','was there any problem during delivery'] },
+
+  { id:'maternal_history',
+    keywords:['mother','maternal','antenatal','pregnancy','rupture','membranes',
+              'rom','prom','intrapartum','gestational','obstetric','booking',
+              'maternal fever','waters','bag of waters'],
+    phrases:['any maternal history','mother history','any problems during pregnancy',
+             'any rupture of membranes','maternal fever','any antenatal problems',
+             'how was the pregnancy','how was antenatal','any complications in pregnancy',
+             'when did the waters break','prolonged rupture','maternal complications'] },
   { id:'birth_cry',        keywords:['cry','cried','crying','scream','shout','wail','vigorous'],
     phrases:['did baby cry','did he cry','did she cry','cry at birth','cry after birth','cry immediately','vigorous cry','birth cry','cried at birth','cried after birth','did the baby cry','was there a cry'] },
   { id:'parity',          keywords:['parity','gravida','para','previous pregnancy','first pregnancy','second pregnancy','how many children','obstetric history','miscarriage','abortion','stillbirth','previous delivery'],
