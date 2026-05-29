@@ -821,7 +821,7 @@ async function handleChat(request, env, ctx) {
       };
 
       // Symptom NOT in case → return negative reply immediately, skip LLM queue
-      if (!symptomInCase(normText, caseSymptoms)) {
+      if (caseSymptoms.length > 0 && !symptomInCase(normText, caseSymptoms)) {
         const negativeReply = generateNegativeReply(normText, caseData);
         // Still queue silently — LLM will generate a more nuanced version for next time
         if (ctx) {
@@ -886,7 +886,7 @@ async function handleChat(request, env, ctx) {
       };
 
       // Symptom NOT in case → return negative reply immediately
-      if (!symptomInCase(normText, caseSymptoms)) {
+      if (caseSymptoms.length > 0 && !symptomInCase(normText, caseSymptoms)) {
         const negativeReply = generateNegativeReply(normText, caseData);
         if (ctx) {
           ctx.waitUntil(supabaseAskQuestion(caseId, message, caseCtx, temperament, env, caseSymptoms));
